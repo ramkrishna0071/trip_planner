@@ -1,0 +1,78 @@
+# ------------------------------
+# OS files
+# ------------------------------
+.DS_Store
+Thumbs.db
+
+# ------------------------------
+# Python cache & artifacts
+# ------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+*.sqlite3
+*.db
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+*.manifest
+*.spec
+
+# ------------------------------
+# Environments
+# ------------------------------
+.venv/
+venv/
+env/
+ENV/
+.env
+.python-version
+
+# ------------------------------
+# Logs & debug
+# ------------------------------
+*.log
+logs/
+debug.log
+
+# ------------------------------
+# IDE & editors
+# ------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ------------------------------
+# Tests / coverage
+# ------------------------------
+.coverage
+htmlcov/
+.tox/
+.nox/
+.pytest_cache/
+.cache/
+.mypy_cache/
+.pyre/
+.dmypy.json
+dmypy.json
+
+# ------------------------------
+# Jupyter & notebooks
+# ------------------------------
+.ipynb_checkpoints/
+*.ipynb
+
+# ------------------------------
+# Misc
+# ------------------------------
+*.bak
+*.tmp
+*.orig
+
