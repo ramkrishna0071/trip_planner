@@ -1,6 +1,7 @@
 # app/orchestrator.py
 from __future__ import annotations
 
+import os
 from typing import List, Dict, Any, Tuple
 from collections.abc import Iterable
 from datetime import datetime
@@ -27,7 +28,8 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
     logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+_level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _level, logging.INFO))
 logger.propagate = False
 
 # If your websearch tool isn't ready, these imports will be skipped gracefully.
@@ -56,6 +58,8 @@ def plan_trip(
 ) -> TripResponse:
     """Produce baseline bundles informed by optional agent context."""
 
+    # Harmonise any agent context that upstream agents may have assembled.
+
     if isinstance(context, AgentContext):
         ctx: Dict[str, Any] = context.model_dump(mode="python")
     elif isinstance(context, dict):
@@ -65,6 +69,8 @@ def plan_trip(
     else:
         ctx = dict(context)  # type: ignore[arg-type]
 
+    # Break context into the buckets produced by earlier agents. Missing keys
+    # are normal when adapters are offline, so default to empty structures.
     foundation_ctx = ctx.get("foundation", {}) or {}
     logistics_ctx = ctx.get("logistics", {}) or {}
     dest_ctx_list = ctx.get("destinations", []) or []
@@ -79,6 +85,7 @@ def plan_trip(
             if item not in combined_notes:
                 combined_notes.append(item)
 
+    # Trip length and per-destination allocations feed most downstream estimates.
     trip_days = int(foundation_ctx.get("dates", {}).get("duration_days") or max(1, _days(req.dates.start, req.dates.end)))
     nights = int(foundation_ctx.get("dates", {}).get("nights") or max(1, trip_days - 1))
     n_stops = max(1, len(req.destinations))
@@ -100,7 +107,15 @@ def plan_trip(
         req.budget_total,
         req.currency,
     )
+    logger.debug(
+        "Context snapshot — notes:%d foundation:%s logistics_legs:%d",
+        len(combined_notes),
+        sorted(foundation_ctx.keys()),
+        len(logistics_ctx.get("legs") or []),
+    )
 
+    # Build a simple stay blueprint for each stop. Bundle builders will mutate
+    # these to offer cheaper or more comfortable mixes.
     stays = [
         Stay(city=city, nights=n, style="hotel", budget_per_night=ppd_val * 0.4 * party_size)
         for city, n in zip(req.destinations, nights_allocation)
@@ -153,6 +168,8 @@ def plan_trip(
         for s in stays
     ]
 
+    # Construct a mix of bundles that share the baseline experiences but vary
+    # in the level of spend and pace.
     options: List[PlanBundle] = [
         _build_plan_bundle(
             label="balanced",
@@ -220,6 +237,7 @@ def plan_trip(
     ]
 
     metrics = [_plan_metrics(bundle, req.budget_total) for bundle in options]
+    logger.debug("Computed metrics for %d bundles", len(metrics))
     base_scores = _build_normalized_scores(metrics)
 
     scored_options: List[PlanBundle] = []
@@ -242,12 +260,19 @@ def plan_trip(
     options = sorted(scored_options, key=lambda b: b.scores.get("composite", 0.0), reverse=True)
 
     agent_context_model = AgentContext.model_validate(ctx) if ctx else None
+    logger.info(
+        "Generated %d candidate bundles; best composite %.2f",
+        len(options),
+        options[0].scores.get("composite", 0.0) if options else 0.0,
+    )
     return TripResponse(query_echo=req, options=options, agent_context=agent_context_model)
 
 # ---------- LLM + (optional) web sources ----------
-async def orchestrate_llm_trip(payload: Dict[str, Any],
-                               allow_domains: List[str] | None = None,
-                               deny_domains: List[str] | None = None) -> Dict[str, Any]:
+async def orchestrate_llm_trip(
+    payload: Dict[str, Any],
+    allow_domains: List[str] | None = None,
+    deny_domains: List[str] | None = None,
+) -> Dict[str, Any]:
     """Build queries, optionally web-search + fetch snippets, call LLM, return dict."""
     logger.info(
         "Orchestration start: origin=%s, destinations=%s, dates=%s-%s, budget=%s", 
@@ -258,8 +283,10 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         payload.get("budget_total") or payload.get("budget"),
     )
     foundation = extract_foundation(payload)
+    logger.debug("Foundation context keys: %s", sorted(foundation.keys()))
     trip_req = TripRequest.model_validate(payload)
 
+    # Normalise any free-form user preferences before they travel through agents.
     if "interests" in payload:
         raw_interests = payload.get("interests")
         if isinstance(raw_interests, str):
@@ -288,7 +315,8 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         deny_domains if deny_domains is not None else payload.get("deny_domains")
     )
 
-    # Build queries from payload
+    # Build queries from payload. These will be surfaced in logs so operators can
+    # understand what the orchestrator attempted to fetch from the web.
     queries: List[str] = []
     dests: List[str] = list(foundation.get("destinations", [])) or trip_req.destinations
     if len(dests) >= 2:
@@ -299,6 +327,8 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
     if dests:
         origin = trip_req.origin
         queries.append(f"visa requirements {origin} to {dests[-1]} official")
+
+    logger.info("Assembled %d search queries", len(queries))
 
     # Build snippets (empty if WebSearcher not available)
     snippets: List[Dict[str, str]] = []
@@ -315,6 +345,7 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         for q in queries:
             try:
                 hits = await searcher.search(q)
+                logger.info("Search query '%s' produced %d hits", q, len(hits))
                 results.extend(hits)
             except Exception:
                 logger.warning("Search failed for query '%s'", q, exc_info=True)
@@ -337,9 +368,16 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         for d in docs:
             if getattr(d, "url", None):
                 snippets.append({"url": d.url, "title": getattr(d, "title", "") or "", "text": getattr(d, "text", "") or ""})
+        logger.info(
+            "Collected %d unique snippets from %d raw hits (allowed domains: %s)",
+            len(snippets),
+            len(results),
+            ", ".join(resolved_allow) if resolved_allow else "*",
+        )
     else:
         logger.info("WebSearcher unavailable; continuing with heuristic planning only")
 
+    # Derive richer context from specialised agents.
     destination_context = expand_destinations(foundation, snippets)
     logistics_context = compute_logistics(foundation)
 
@@ -349,6 +387,9 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         *(logistics_context.get("feasibility_notes", []) or []),
     )}.keys())
 
+    # Promote the snippet URLs so downstream consumers can surface citations.
+    source_links = sorted({snip["url"] for snip in snippets if snip.get("url")})
+
     agent_context: Dict[str, Any] = {
         "foundation": foundation,
         "destinations": destination_context.get("destinations", []),
@@ -356,10 +397,18 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         "notes": aggregated_notes,
         "sources": destination_context.get("sources", []),
         "snippets": snippets,
+        "source_links": source_links,
     }
 
+    # Produce the deterministic baseline plan. The LLM later layers narrative.
     baseline_plan = plan_trip(trip_req, agent_context)
     baseline_dump = baseline_plan.model_dump(mode="json")
+    baseline_dump["source_links"] = source_links
+    logger.info(
+        "Baseline planner produced %d bundles; top label: %s",
+        len(baseline_plan.options),
+        baseline_plan.options[0].label if baseline_plan.options else "n/a",
+    )
 
     # Call LLM (your llm.py returns a dict already)
     try:
@@ -367,6 +416,11 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         enriched_payload["agent_context"] = agent_context
         logger.info("Calling LLM with %d snippets", len(snippets))
         data = call_llm(enriched_payload, snippets)
+        if isinstance(data, dict):
+            logger.info(
+                "LLM response received with keys: %s",
+                ", ".join(sorted(data.keys())),
+            )
     except Exception as exc:
         logger.exception("LLM call failed: %s", exc)
         return {
@@ -380,6 +434,7 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         data.setdefault("baseline_plan", baseline_dump)
         data.setdefault("snippets", snippets)
         data.setdefault("agent_context", agent_context)
+        data.setdefault("source_links", source_links)
         return data
 
     return {
@@ -387,6 +442,7 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         "baseline_plan": baseline_dump,
         "snippets": snippets,
         "agent_context": agent_context,
+        "source_links": source_links,
     }
 
 # ---------- helpers ----------
