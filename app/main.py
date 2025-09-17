@@ -3,7 +3,9 @@ from app.orchestrator import orchestrate_llm_trip
 from fastapi import Body
 app = FastAPI(title="Trip Planner Agentic API")
 
-@app.post("/trip/llm_only")
+
+@app.post("/api/plan")
+@app.post("/trip/llm_only", include_in_schema=False)
 async def trip_llm_only(
     origin: str = Body(...),
     purpose: str = Body(...),
