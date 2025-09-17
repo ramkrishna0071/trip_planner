@@ -206,8 +206,8 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
                                allow_domains: List[str] | None = None,
                                deny_domains: List[str] | None = None) -> Dict[str, Any]:
     """Build queries, optionally web-search + fetch snippets, call LLM, return dict."""
+    foundation = extract_foundation(payload)
     trip_req = TripRequest.model_validate(payload)
-    foundation = extract_foundation(trip_req)
 
     if "interests" in payload:
         raw_interests = payload.get("interests")

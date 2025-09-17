@@ -19,8 +19,10 @@ class _OpenAIStub:
         pass
 
 
+# Stub the openai import so tests don't require the real package
 sys.modules["openai"] = SimpleNamespace(OpenAI=_OpenAIStub)
 
+# Prefer real httpx when available, otherwise fall back to a stub that surfaces a clear error
 try:  # pragma: no cover - prefer real httpx when available
     httpx = importlib.import_module("httpx")  # type: ignore
 except ModuleNotFoundError:  # pragma: no cover
@@ -221,7 +223,9 @@ def test_orchestrator_respects_payload_domain_lists(monkeypatch):
 
         snippets = data.get("snippets")
         assert snippets is not None
-        assert snippets == [{"url": "https://allowed.com/a", "title": "Title for https://allowed.com/a", "text": "Snippet text"}]
+        assert snippets == [
+            {"url": "https://allowed.com/a", "title": "Title for https://allowed.com/a", "text": "Snippet text"}
+        ]
         assert captured_snippets["value"] == snippets
 
     asyncio.run(run())
