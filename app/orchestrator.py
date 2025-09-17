@@ -5,8 +5,19 @@ from typing import List, Dict, Any
 from datetime import datetime
 import asyncio
 
-from app.schemas import TripRequest, TripResponse, PlanBundle, TravelLeg, Stay, DayPlan
+from app.schemas import (
+    TripRequest,
+    TripResponse,
+    PlanBundle,
+    TravelLeg,
+    Stay,
+    DayPlan,
+    AgentContext,
+)
 from app.llm import call_llm  # import at module top to avoid circulars
+from app.agents.foundation_agent import extract_foundation
+from app.agents.destination_scout import expand_destinations
+from app.agents.logistics_planner import compute_logistics
 
 # If your websearch tool isn't ready, these imports will be skipped gracefully.
 try:
@@ -28,20 +39,73 @@ except Exception:
             return (not self.allow_domains) or any(host.endswith(d) for d in self.allow_domains)
 
 # ---------- baseline generic planner (no web, fast) ----------
-def plan_trip(req: TripRequest) -> TripResponse:
-    trip_days = max(1, _days(req.dates.start, req.dates.end))
-    party_size = req.party.adults + req.party.children + req.party.seniors
-    nights = max(1, trip_days - 1)
+def plan_trip(
+    req: TripRequest,
+    context: AgentContext | Dict[str, Any] | None = None,
+) -> TripResponse:
+    """Produce baseline bundles informed by optional agent context."""
+
+    if isinstance(context, AgentContext):
+        ctx: Dict[str, Any] = context.model_dump(mode="python")
+    elif isinstance(context, dict):
+        ctx = dict(context)
+    elif context is None:
+        ctx = {}
+    else:
+        ctx = dict(context)  # type: ignore[arg-type]
+
+    foundation_ctx = ctx.get("foundation", {}) or {}
+    logistics_ctx = ctx.get("logistics", {}) or {}
+    dest_ctx_list = ctx.get("destinations", []) or []
+
+    combined_notes: List[str] = []
+    for bucket in (
+        foundation_ctx.get("notes", []),
+        ctx.get("notes", []),
+        logistics_ctx.get("feasibility_notes", []),
+    ):
+        for item in bucket or []:
+            if item not in combined_notes:
+                combined_notes.append(item)
+
+    trip_days = int(foundation_ctx.get("dates", {}).get("duration_days") or max(1, _days(req.dates.start, req.dates.end)))
+    nights = int(foundation_ctx.get("dates", {}).get("nights") or max(1, trip_days - 1))
     n_stops = max(1, len(req.destinations))
-    nights_each = _split_nights(nights, n_stops)
-    ppd_val = _ppd(req.budget_total, trip_days, party_size)
+
+    nights_allocation = list(foundation_ctx.get("nights_allocation", [])) if foundation_ctx else []
+    if len(nights_allocation) != n_stops:
+        nights_allocation = _split_nights(nights, n_stops)
+
+    party_size = req.party.adults + req.party.children + req.party.seniors
+    ppd_val = float(foundation_ctx.get("budget", {}).get("per_person_per_day") or _ppd(req.budget_total, trip_days, party_size))
 
     stays = [
         Stay(city=city, nights=n, style="hotel", budget_per_night=ppd_val * 0.4 * party_size)
-        for city, n in zip(req.destinations, nights_each)
+        for city, n in zip(req.destinations, nights_allocation)
     ]
-    experiences = _day_plans(req.destinations, nights_each)
-    intercity = _legs_for(req.destinations)
+
+    dest_map: Dict[str, Dict[str, Any]] = {
+        d.get("city"): d for d in dest_ctx_list if isinstance(d, dict) and d.get("city")
+    }
+    experiences = _day_plans(req.destinations, nights_allocation, dest_map)
+
+    logistic_legs = logistics_ctx.get("legs") or []
+    if logistic_legs:
+        intercity = []
+        for idx, leg in enumerate(logistic_legs):
+            frm = leg.get("from") or leg.get("frm") or (req.destinations[idx] if idx < len(req.destinations) else req.destinations[0])
+            to = leg.get("to") or (req.destinations[idx + 1] if idx + 1 < len(req.destinations) else req.destinations[-1])
+            leg_payload = {
+                "mode": leg.get("mode", "train"),
+                "from": frm,
+                "to": to,
+                "date": leg.get("depart_date"),
+                "duration_hr": leg.get("duration_hr"),
+                "cost_estimate": leg.get("cost_estimate"),
+            }
+            intercity.append(TravelLeg(**leg_payload))
+    else:
+        intercity = _legs_for(req.destinations)
 
     base_cost_stay = sum(s.nights * s.budget_per_night for s in stays)
     base_cost_move = sum(l.cost_estimate or 0 for l in intercity)
@@ -62,7 +126,9 @@ def plan_trip(req: TripRequest) -> TripResponse:
         stays=cheapest_stays,
         local_transport=["metro/day-pass", "bus", "rideshare (as needed)"],
         experience_plan=experiences,
-        notes=["Indicative prices; replace with live quotes when adapters are connected."]
+        notes=["Indicative prices; replace with live quotes when adapters are connected."] + combined_notes,
+        feasibility_notes=combined_notes,
+        transfer_buffers=dict(logistics_ctx.get("transfer_buffers", {})),
     )
 
     comfort_legs = [
@@ -86,7 +152,9 @@ def plan_trip(req: TripRequest) -> TripResponse:
         stays=comfort_stays,
         local_transport=["hotel pickup", "metro", "rideshare"],
         experience_plan=experiences,
-        notes=["Upgrade selected hops to flights; swap stays to boutique."]
+        notes=["Upgrade selected hops to flights; swap stays to boutique."] + combined_notes,
+        feasibility_notes=combined_notes,
+        transfer_buffers=dict(logistics_ctx.get("transfer_buffers", {})),
     )
 
     balanced = PlanBundle(
@@ -100,7 +168,9 @@ def plan_trip(req: TripRequest) -> TripResponse:
         stays=stays,
         local_transport=["metro", "IC card", "occasional rideshare"],
         experience_plan=experiences,
-        notes=["Good default; tune by preferences (diet, mobility)."]
+        notes=["Good default; tune by preferences (diet, mobility)."] + combined_notes,
+        feasibility_notes=combined_notes,
+        transfer_buffers=dict(logistics_ctx.get("transfer_buffers", {})),
     )
 
     options = [balanced, cheapest, comfort]
@@ -111,7 +181,8 @@ def plan_trip(req: TripRequest) -> TripResponse:
     else:
         options = [balanced, cheapest, comfort]
 
-    return TripResponse(query_echo=req, options=options)
+    agent_context_model = AgentContext.model_validate(ctx) if ctx else None
+    return TripResponse(query_echo=req, options=options, agent_context=agent_context_model)
 
 # ---------- LLM + (optional) web sources ----------
 async def orchestrate_llm_trip(payload: Dict[str, Any],
@@ -119,12 +190,11 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
                                deny_domains: List[str] | None = None) -> Dict[str, Any]:
     """Build queries, optionally web-search + fetch snippets, call LLM, return dict."""
     trip_req = TripRequest.model_validate(payload)
-    baseline_plan = plan_trip(trip_req)
-    baseline_dump = baseline_plan.model_dump(mode="json")
+    foundation = extract_foundation(trip_req)
 
     # Build queries from payload
     queries: List[str] = []
-    dests: List[str] = trip_req.destinations
+    dests: List[str] = list(foundation.get("destinations", [])) or trip_req.destinations
     if len(dests) >= 2:
         for a, b in zip(dests[:-1], dests[1:]):
             queries.append(f"how to travel {a} to {b} train flight bus cost")
@@ -166,25 +236,51 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
             if getattr(d, "url", None):
                 snippets.append({"url": d.url, "title": getattr(d, "title", "") or "", "text": getattr(d, "text", "") or ""})
 
+    destination_context = expand_destinations(foundation, snippets)
+    logistics_context = compute_logistics(foundation)
+
+    aggregated_notes = list({note: None for note in (
+        *(foundation.get("notes", []) or []),
+        *(destination_context.get("notes", []) or []),
+        *(logistics_context.get("feasibility_notes", []) or []),
+    )}.keys())
+
+    agent_context: Dict[str, Any] = {
+        "foundation": foundation,
+        "destinations": destination_context.get("destinations", []),
+        "logistics": logistics_context,
+        "notes": aggregated_notes,
+        "sources": destination_context.get("sources", []),
+        "snippets": snippets,
+    }
+
+    baseline_plan = plan_trip(trip_req, agent_context)
+    baseline_dump = baseline_plan.model_dump(mode="json")
+
     # Call LLM (your llm.py returns a dict already)
     try:
-        data = call_llm(payload, snippets)
+        enriched_payload = dict(payload)
+        enriched_payload["agent_context"] = agent_context
+        data = call_llm(enriched_payload, snippets)
     except Exception as exc:
         return {
             "baseline_plan": baseline_dump,
             "snippets": snippets,
+            "agent_context": agent_context,
             "llm_error": str(exc),
         }
 
     if isinstance(data, dict):
         data.setdefault("baseline_plan", baseline_dump)
         data.setdefault("snippets", snippets)
+        data.setdefault("agent_context", agent_context)
         return data
 
     return {
         "llm_raw": data,
         "baseline_plan": baseline_dump,
         "snippets": snippets,
+        "agent_context": agent_context,
     }
 
 # ---------- helpers ----------
@@ -197,16 +293,34 @@ def _split_nights(total_nights: int, n_stops: int) -> List[int]:
 def _ppd(budget_total: float, days: int, party_size: int) -> float:
     return max(1.0, budget_total / max(1, days) / max(1, party_size))
 
-def _day_plans(cities: List[str], nights_each: List[int]) -> List[DayPlan]:
+def _day_plans(
+    cities: List[str],
+    nights_each: List[int],
+    dest_context: Dict[str, Dict[str, Any]] | None = None,
+) -> List[DayPlan]:
     out: List[DayPlan] = []
+    dest_context = dest_context or {}
     for city, n in zip(cities, nights_each):
-        for _ in range(n):
-            out.append(DayPlan(
-                city=city,
-                must_do=[f"Top sights in {city}"],
-                hidden_gem=[f"Neighborhood food lane in {city}"],
-                flex_hours=2
-            ))
+        info = dest_context.get(city, {})
+        must_do = info.get("highlights") or [f"Top sights in {city}"]
+        experiences = info.get("experiences") or []
+        dining = info.get("dining") or []
+        for day in range(max(1, n)):
+            hidden: List[str] = []
+            if experiences:
+                hidden.append(experiences[min(day, len(experiences) - 1)])
+            if dining:
+                hidden.append(dining[min(day, len(dining) - 1)])
+            if not hidden:
+                hidden = [f"Neighborhood food lane in {city}"]
+            out.append(
+                DayPlan(
+                    city=city,
+                    must_do=must_do[:3],
+                    hidden_gem=hidden,
+                    flex_hours=2 if experiences else 3,
+                )
+            )
     return out
 
 def _legs_for(cities: List[str]) -> List[TravelLeg]:

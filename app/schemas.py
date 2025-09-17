@@ -50,6 +50,14 @@ class DayPlan(BaseModel):
     hidden_gem: List[str] = Field(default_factory=list)    # [] -> default_factory
     flex_hours: int = 2
 
+class AgentContext(BaseModel):
+    foundation: Dict[str, object] = Field(default_factory=dict)
+    destinations: List[Dict[str, object]] = Field(default_factory=list)
+    logistics: Dict[str, object] = Field(default_factory=dict)
+    notes: List[str] = Field(default_factory=list)
+    sources: List[Dict[str, str]] = Field(default_factory=list)
+    snippets: List[Dict[str, str]] = Field(default_factory=list)
+
 class PlanBundle(BaseModel):
     label: Literal["balanced","cheapest","comfort","family_friendly"]
     summary: str
@@ -62,7 +70,10 @@ class PlanBundle(BaseModel):
     local_transport: List[str] = Field(default_factory=list)    # [] -> default_factory
     experience_plan: List[DayPlan] = Field(default_factory=list) # [] -> default_factory
     notes: List[str] = Field(default_factory=list)               # [] -> default_factory
+    feasibility_notes: List[str] = Field(default_factory=list)
+    transfer_buffers: Dict[str, float] = Field(default_factory=dict)
 
 class TripResponse(BaseModel):
     query_echo: TripRequest
     options: List[PlanBundle] = Field(default_factory=list)      # [] -> default_factory
+    agent_context: Optional[AgentContext] = None
