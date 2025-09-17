@@ -463,11 +463,12 @@ async def orchestrate_llm_trip(
         logger.info("WebSearcher unavailable; continuing with heuristic planning only")
 
     # Derive richer context from specialised agents.
-destination_context = expand_destinations(foundation, snippets)
+    destination_context = expand_destinations(foundation, snippets)
+    logistics_context = compute_logistics(foundation)
 
-llm_sources: List[Dict[str, Any]] = []
-heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
-remaining_heuristics = set(heuristic_cities)
+    llm_sources: List[Dict[str, Any]] = []
+    heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
+    remaining_heuristics = set(heuristic_cities)
     if heuristic_cities:
         missing_details: List[str] = []
         for city in heuristic_cities:
