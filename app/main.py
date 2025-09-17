@@ -27,7 +27,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 async def _plan_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Validate the incoming payload and delegate to the orchestrator."""
 
@@ -36,22 +35,19 @@ async def _plan_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         TripRequest.model_validate(payload)
-    except ValidationError as exc:  # pragma: no cover - re-raise for FastAPI
+    except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
 
     allow_domains: List[str] | None = payload.get("allow_domains")
     deny_domains: List[str] | None = payload.get("deny_domains")
     return await orchestrate_llm_trip(payload, allow_domains, deny_domains)
 
-
 @app.post("/api/plan")
 async def api_plan(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
     """Primary endpoint consumed by the Vite frontend."""
-
     return await _plan_from_payload(payload)
 
-
-@app.post("/trip/llm_only")
+@app.post("/trip/llm_only", include_in_schema=False)
 async def trip_llm_only(
     origin: str = Body(...),
     purpose: str | None = Body(None),

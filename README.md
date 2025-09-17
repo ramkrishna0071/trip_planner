@@ -39,8 +39,8 @@ Launch the API server with uvicorn:
 uv run uvicorn app.main:app --reload
 ```
 
-The primary endpoint is `POST /api/plan`, which accepts the `TripRequest`
-schema from `app/schemas.py`. Example payload:
+The primary endpoint is `POST /api/plan`, which accepts the `TripRequest` schema from `app/schemas.py`. Example payload:
+
 
 ```json
 {

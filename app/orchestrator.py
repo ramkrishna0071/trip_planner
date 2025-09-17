@@ -463,11 +463,11 @@ async def orchestrate_llm_trip(
         logger.info("WebSearcher unavailable; continuing with heuristic planning only")
 
     # Derive richer context from specialised agents.
-    destination_context = expand_destinations(foundation, snippets)
+destination_context = expand_destinations(foundation, snippets)
 
-    llm_sources: List[Dict[str, Any]] = []
-    heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
-    remaining_heuristics = set(heuristic_cities)
+llm_sources: List[Dict[str, Any]] = []
+heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
+remaining_heuristics = set(heuristic_cities)
     if heuristic_cities:
         missing_details: List[str] = []
         for city in heuristic_cities:
@@ -493,6 +493,7 @@ async def orchestrate_llm_trip(
             or os.getenv("TRIP_PLANNER_FALLBACK_MODEL")
             or "gpt-4o-mini"
         )
+        
         backfill_data = llm_backfill_city_details(heuristic_cities, foundation, model=backfill_model)
         if backfill_data:
             dest_notes = destination_context.setdefault("notes", []) or []
@@ -564,7 +565,7 @@ async def orchestrate_llm_trip(
                 }
             )
 
-    logistics_context = compute_logistics(foundation)
+
 
     aggregated_notes = list({note: None for note in (
         *(foundation.get("notes", []) or []),
@@ -574,11 +575,10 @@ async def orchestrate_llm_trip(
 
     # Promote the snippet URLs so downstream consumers can surface citations.
     source_links = sorted({snip["url"] for snip in snippets if snip.get("url")})
+
     extra_source_urls = [src.get("url") for src in destination_context.get("sources", []) if src.get("url")]
     if extra_source_urls:
         source_links = sorted({*source_links, *extra_source_urls})
-    if llm_sources:
-        source_links = sorted({*source_links, *(f"llm://{entry['model']}" for entry in llm_sources)})
 
     agent_context: Dict[str, Any] = {
         "foundation": foundation,

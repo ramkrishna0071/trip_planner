@@ -71,7 +71,10 @@ function App() {
   const planNotes = planResult?.agent_context?.notes ?? [];
 
   const addMessage = (message) => {
-    setMessages((prev) => [...prev, { ...message, id: `${message.role}-${Date.now()}-${Math.random().toString(16).slice(2)}` }]);
+    setMessages((prev) => [
+      ...prev,
+      { ...message, id: `${message.role}-${Date.now()}-${Math.random().toString(16).slice(2)}` },
+    ]);
   };
 
   const handlePlanSubmit = async (formValues) => {
@@ -79,7 +82,9 @@ function App() {
 
     addMessage({
       role: 'user',
-      content: `I want to travel from ${requestPayload.origin} to ${formatDestinations(requestPayload.destinations)} between ${requestPayload.dates.start} and ${requestPayload.dates.end} with a budget of $${requestPayload.budget_total}.` ,
+      content: `I want to travel from ${requestPayload.origin} to ${formatDestinations(
+        requestPayload.destinations
+      )} between ${requestPayload.dates.start} and ${requestPayload.dates.end} with a budget of $${requestPayload.budget_total}.`,
     });
 
     setLoading(true);

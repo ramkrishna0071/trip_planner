@@ -19,6 +19,7 @@ _level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
 logger.setLevel(getattr(logging, _level, logging.INFO))
 logger.propagate = False
 
+
 DEFAULT_HEADERS: Dict[str, str] = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -31,6 +32,7 @@ DEFAULT_HEADERS: Dict[str, str] = {
     "Pragma": "no-cache",
     "Referer": "https://www.google.com/",
 }
+
 
 @dataclass
 class SourcePolicy:
