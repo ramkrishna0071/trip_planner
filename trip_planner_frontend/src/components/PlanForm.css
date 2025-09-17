@@ -1,0 +1,78 @@
+.plan-form {
+  background: #ffffff;
+  border-radius: 16px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  box-shadow: 0 12px 40px rgba(15, 23, 42, 0.08);
+}
+
+.plan-form__header h2 {
+  margin: 0 0 4px;
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+.plan-form__header p {
+  margin: 0;
+  color: #475467;
+  font-size: 0.95rem;
+}
+
+.plan-form__grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+.plan-form__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 0.85rem;
+  color: #475467;
+}
+
+.plan-form__field span {
+  font-weight: 500;
+}
+
+.plan-form__field input,
+.plan-form__field select {
+  border: 1px solid #d0d5dd;
+  border-radius: 10px;
+  padding: 10px 12px;
+  font-size: 0.95rem;
+  transition: border 0.2s ease;
+}
+
+.plan-form__field input:focus,
+.plan-form__field select:focus {
+  outline: none;
+  border-color: #6366f1;
+  box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15);
+}
+
+.plan-form__submit {
+  align-self: flex-start;
+  background: linear-gradient(135deg, #6366f1, #8b5cf6);
+  color: #ffffff;
+  border: none;
+  padding: 12px 20px;
+  font-size: 1rem;
+  border-radius: 999px;
+  cursor: pointer;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.plan-form__submit:disabled {
+  background: #c7d2fe;
+  cursor: wait;
+  box-shadow: none;
+}
+
+.plan-form__submit:not(:disabled):hover {
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(99, 102, 241, 0.3);
+}

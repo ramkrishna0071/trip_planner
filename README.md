@@ -37,8 +37,8 @@ Launch the API server with uvicorn:
 uv run uvicorn app.main:app --reload
 ```
 
-The primary endpoint is `POST /plan`, which accepts the `TripRequest` schema
-from `app/schemas.py`. Example payload:
+The primary endpoint is `POST /api/plan`, which accepts the `TripRequest`
+schema from `app/schemas.py`. Example payload:
 
 ```json
 {
@@ -54,6 +54,16 @@ from `app/schemas.py`. Example payload:
 
 The response now includes `source_links`, `snippets`, and `agent_context`
 entries so you can attribute recommendations and inspect intermediate state.
+
+> **Tip:** The React frontend under `trip_planner_frontend/` targets
+> `http://localhost:8000/api/plan` by default. Set
+> `VITE_API_BASE_URL=http://localhost:8000` in
+> `trip_planner_frontend/.env.local` while the FastAPI server is running to
+> see live orchestration output instead of the bundled sample itinerary.
+
+If you need to restrict browser origins, configure
+`TRIP_PLANNER_ALLOWED_ORIGINS` (comma-separated list). The default `*` keeps
+local development simple by allowing the Vite dev server to call the API.
 
 ## Inspecting orchestration logs
 
@@ -88,5 +98,6 @@ All new features should include coverage in `tests/` where practical.
 - `app/llm.py` – wrapper around the OpenAI client with graceful fallbacks.
 - `app/agents/` – specialised heuristics for foundation, destination, and logistics insights.
 - `debug_orchestrator.py` – quick entry point for manual experiments.
+- `trip_planner_frontend/` – React + Vite workspace that mirrors conversational planners and surfaces booking links alongside orchestrator bundles. See its README for setup instructions.
 
 Happy trip planning!

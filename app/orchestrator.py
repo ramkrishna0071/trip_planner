@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 from typing import List, Dict, Any, Tuple
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import urlencode, quote_plus
 import asyncio
 import logging
 
@@ -17,8 +18,9 @@ from app.schemas import (
     DayPlan,
     AgentContext,
     TripPrefs,
+    BookingLink,
 )
-from app.llm import call_llm  # import at module top to avoid circulars
+from app.llm import call_llm, llm_backfill_city_details  # import at module top to avoid circulars
 from app.agents.foundation_agent import extract_foundation
 from app.agents.destination_scout import expand_destinations
 from app.agents.logistics_planner import compute_logistics
@@ -95,7 +97,11 @@ def plan_trip(
         nights_allocation = _split_nights(nights, n_stops)
 
     party_size = req.party.adults + req.party.children + req.party.seniors
-    ppd_val = float(foundation_ctx.get("budget", {}).get("per_person_per_day") or _ppd(req.budget_total, trip_days, party_size))
+    ppd_val = float(
+        foundation_ctx.get("budget", {}).get("per_person_per_day")
+        or _ppd(req.budget_total, trip_days, party_size)
+    )
+    stay_windows = _infer_stay_windows(req, nights_allocation, logistics_ctx, foundation_ctx)
 
     logger.info(
         "Planning trip for %s travellers from %s visiting %s between %s and %s with budget %.2f %s",
@@ -158,6 +164,26 @@ def plan_trip(
         req.budget_total,
     )
 
+    budget_delta = baseline_total - req.budget_total
+    ctx["costs"] = {
+        "currency": req.currency,
+        "stays": round(base_cost_stay, 2),
+        "transport": round(base_cost_move, 2),
+        "food": round(food_misc, 2),
+        "other": 0.0,
+        "total": round(baseline_total, 2),
+        "budget": req.budget_total,
+        "delta": round(budget_delta, 2),
+        "status": "over" if budget_delta > 0 else "under" if budget_delta < 0 else "on_budget",
+    }
+    logger.info(
+        "Budget comparison — baseline total %.2f vs budget %.2f (%s %.2f)",
+        baseline_total,
+        req.budget_total,
+        "over by" if budget_delta > 0 else "under by" if budget_delta < 0 else "aligned with",
+        abs(budget_delta),
+    )
+
     _extend_unique(combined_notes, _suggest_date_shifts(req, trip_days, baseline_total))
 
     transfer_buffers = dict(logistics_ctx.get("transfer_buffers", {}))
@@ -185,6 +211,7 @@ def plan_trip(
             experience_plan=[day.model_copy(deep=True) for day in base_experiences],
             transfer_buffers=transfer_buffers,
             transfer_override=len(intercity),
+            stay_windows=stay_windows,
         ),
         _build_plan_bundle(
             label="cheapest",
@@ -203,6 +230,7 @@ def plan_trip(
             experience_plan=[day.model_copy(deep=True) for day in base_experiences],
             transfer_buffers=transfer_buffers,
             transfer_override=max(1, len(intercity)),
+            stay_windows=stay_windows,
         ),
         _build_plan_bundle(
             label="comfort",
@@ -233,6 +261,7 @@ def plan_trip(
             experience_plan=[day.model_copy(deep=True) for day in base_experiences],
             transfer_buffers=transfer_buffers,
             transfer_override=len(intercity),
+            stay_windows=stay_windows,
         ),
     ]
 
@@ -363,11 +392,43 @@ async def orchestrate_llm_trip(
             per_domain[dom] = per_domain.get(dom, 0) + 1
             pruned.append(r)
         # FETCH
-        fetch_tasks = [searcher.fetch(r["url"]) for r in pruned[:policy.max_results]]
-        docs = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        for d in docs:
-            if getattr(d, "url", None):
-                snippets.append({"url": d.url, "title": getattr(d, "title", "") or "", "text": getattr(d, "text", "") or ""})
+        fetch_targets = pruned[:policy.max_results]
+        docs = await asyncio.gather(*[searcher.fetch(r["url"]) for r in fetch_targets], return_exceptions=True)
+        failed_urls: List[str] = []
+        fallback_count = 0
+        for payload, doc in zip(fetch_targets, docs):
+            if isinstance(doc, Exception):
+                failed_urls.append(payload.get("url", ""))
+                logger.warning("Fetcher raised for %s", payload.get("url"), exc_info=True)
+                doc = None
+            if getattr(doc, "url", None):
+                snippets.append(
+                    {
+                        "url": doc.url,
+                        "title": getattr(doc, "title", "") or "",
+                        "text": getattr(doc, "text", "") or "",
+                        "source": "web_fetch",
+                    }
+                )
+                continue
+            snippet_text = payload.get("content") or ""
+            if snippet_text:
+                snippets.append(
+                    {
+                        "url": payload.get("url", ""),
+                        "title": payload.get("title", "") or "",
+                        "text": snippet_text,
+                        "source": "search_summary",
+                    }
+                )
+                fallback_count += 1
+            else:
+                failed_urls.append(payload.get("url", ""))
+        if fallback_count:
+            logger.info("Populated %d snippet(s) from search result summaries", fallback_count)
+        if failed_urls:
+            dedup_failures = sorted({url for url in failed_urls if url})
+            logger.warning("Unable to assemble snippets for %d url(s): %s", len(dedup_failures), ", ".join(dedup_failures))
         logger.info(
             "Collected %d unique snippets from %d raw hits (allowed domains: %s)",
             len(snippets),
@@ -379,6 +440,85 @@ async def orchestrate_llm_trip(
 
     # Derive richer context from specialised agents.
     destination_context = expand_destinations(foundation, snippets)
+
+    llm_sources: List[Dict[str, Any]] = []
+    heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
+    if heuristic_cities:
+        missing_details: List[str] = []
+        for city in heuristic_cities:
+            dest_entry = next(
+                (d for d in destination_context.get("destinations", []) if d.get("city") == city),
+                {},
+            )
+            missing_fields: List[str] = []
+            if not dest_entry.get("highlights"):
+                missing_fields.append("highlights")
+            if not dest_entry.get("experiences"):
+                missing_fields.append("experiences")
+            if not dest_entry.get("dining"):
+                missing_fields.append("dining")
+            if missing_fields:
+                missing_details.append(f"{city}: {', '.join(missing_fields)}")
+        if missing_details:
+            logger.warning("Missing destination intel from web snippets — %s", "; ".join(missing_details))
+
+        backfill_model = (
+            payload.get("llm_backfill_model")
+            or payload.get("llm_model")
+            or os.getenv("TRIP_PLANNER_FALLBACK_MODEL")
+            or "gpt-4o-mini"
+        )
+        backfill_data = llm_backfill_city_details(heuristic_cities, foundation, model=backfill_model)
+        if backfill_data:
+            dest_notes = destination_context.setdefault("notes", []) or []
+            for city, data in backfill_data.items():
+                dest_entry = next(
+                    (d for d in destination_context.get("destinations", []) if d.get("city") == city),
+                    None,
+                )
+                if not dest_entry:
+                    continue
+                filled_fields: List[str] = []
+                for key in ("highlights", "experiences", "dining"):
+                    values = data.get(key)
+                    if values:
+                        dest_entry[key] = values
+                        filled_fields.append(key)
+                if filled_fields:
+                    dest_entry["source"] = "llm"
+                if data.get("notes"):
+                    _extend_unique(dest_notes, data["notes"])
+                    if not filled_fields:
+                        filled_fields.append("notes")
+                if filled_fields:
+                    llm_sources.append({"city": city, "model": backfill_model, "fields": filled_fields})
+            if llm_sources:
+                updated_cities = ", ".join(sorted({entry["city"] for entry in llm_sources}))
+                info_note = f"LLM fallback ({backfill_model}) supplied destination intel for: {updated_cities}."
+                _extend_unique(destination_context.setdefault("notes", []), [info_note])
+                dest_source_bucket = destination_context.setdefault("sources", [])
+                for entry in llm_sources:
+                    dest_source_bucket.append(
+                        {
+                            "city": entry["city"],
+                            "title": f"{entry['city']} fallback via {backfill_model}",
+                            "url": f"llm://{backfill_model}",
+                            "fields": ", ".join(entry["fields"]),
+                        }
+                    )
+                logger.info("LLM backfill (%s) provided destination data for %s", backfill_model, updated_cities)
+        else:
+            logger.warning(
+                "LLM backfill unavailable; retaining heuristic destination highlights for %s",
+                ", ".join(heuristic_cities),
+            )
+            _extend_unique(
+                destination_context.setdefault("notes", []),
+                [
+                    "Heuristic destination highlights retained due to unavailable LLM backfill.",
+                ],
+            )
+
     logistics_context = compute_logistics(foundation)
 
     aggregated_notes = list({note: None for note in (
@@ -389,6 +529,8 @@ async def orchestrate_llm_trip(
 
     # Promote the snippet URLs so downstream consumers can surface citations.
     source_links = sorted({snip["url"] for snip in snippets if snip.get("url")})
+    if llm_sources:
+        source_links = sorted({*source_links, *(f"llm://{entry['model']}" for entry in llm_sources)})
 
     agent_context: Dict[str, Any] = {
         "foundation": foundation,
@@ -398,10 +540,13 @@ async def orchestrate_llm_trip(
         "sources": destination_context.get("sources", []),
         "snippets": snippets,
         "source_links": source_links,
+        "llm_sources": llm_sources,
     }
 
     # Produce the deterministic baseline plan. The LLM later layers narrative.
     baseline_plan = plan_trip(trip_req, agent_context)
+    if baseline_plan.agent_context and getattr(baseline_plan.agent_context, "costs", None):
+        agent_context["costs"] = baseline_plan.agent_context.costs
     baseline_dump = baseline_plan.model_dump(mode="json")
     baseline_dump["source_links"] = source_links
     logger.info(
@@ -486,6 +631,7 @@ def _build_plan_bundle(
     experience_plan: List[DayPlan],
     transfer_buffers: Dict[str, float],
     transfer_override: int | None = None,
+    stay_windows: List[Dict[str, str]] | None = None,
 ) -> PlanBundle:
     working_notes: List[str] = list(base_notes or [])
     stay_total = sum(stay.nights * stay.budget_per_night for stay in stays)
@@ -532,6 +678,14 @@ def _build_plan_bundle(
     if transfers == 0 and adjusted_travel:
         transfers = len(adjusted_travel)
 
+    booking_links = _compose_booking_links(
+        adjusted_stays,
+        adjusted_travel,
+        stay_windows or [],
+        experience_plan,
+        req,
+    )
+
     bundle = PlanBundle(
         label=label,
         summary=summary,
@@ -546,6 +700,7 @@ def _build_plan_bundle(
         notes=notes,
         feasibility_notes=feasibility,
         transfer_buffers=transfer_buffers,
+        booking_links=booking_links,
     )
     final_gap = (
         (bundle.total_cost - req.budget_total) / req.budget_total * 100.0
@@ -562,6 +717,203 @@ def _build_plan_bundle(
     return bundle
 
 
+def _compose_booking_links(
+    stays: List[Stay],
+    travel: List[TravelLeg],
+    stay_windows: List[Dict[str, str]],
+    experience_plan: List[DayPlan],
+    req: TripRequest,
+) -> List[BookingLink]:
+    links: List[BookingLink] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def _append(category: str, label: str, url: str, details: str | None = None) -> None:
+        if not url:
+            return
+        key = (category, label, url)
+        if key in seen:
+            return
+        seen.add(key)
+        links.append(BookingLink(category=category, label=label, url=url, details=details))
+
+    window_by_city = {}
+    for idx, stay in enumerate(stays):
+        window = stay_windows[idx] if idx < len(stay_windows) else {}
+        window_by_city.setdefault(stay.city, window)
+        check_in = window.get("check_in")
+        check_out = window.get("check_out")
+        url = _build_hotel_url(stay.city, check_in, check_out, req)
+        details = _format_date_range(check_in, check_out, suffix=f" • {stay.nights} night(s)")
+        _append("stay", f"Stay in {stay.city}", url, details)
+
+    for leg in travel:
+        depart_date = _coerce_date(leg.date) or window_by_city.get(leg.frm, {}).get("check_out")
+        url = _build_transport_url(leg, depart_date)
+        category = leg.mode if leg.mode in {"flight", "train", "bus"} else "transport"
+        details = f"Depart {depart_date}" if depart_date else None
+        _append(category, f"{leg.mode.title()} {leg.frm} → {leg.to}", url, details)
+
+    for stay in stays:
+        window = window_by_city.get(stay.city, {})
+        arrival = window.get("check_in")
+        departure = window.get("check_out")
+        url = _build_city_pass_url(stay.city, arrival, departure)
+        details = _format_date_range(arrival, departure)
+        _append("local_pass", f"{stay.city} city & transit passes", url, details)
+
+    experience_queries: Dict[str, List[str]] = {}
+    for day in experience_plan:
+        if not day.city:
+            continue
+        queries = experience_queries.setdefault(day.city, [])
+        for item in day.must_do[:1]:
+            cleaned = item.strip()
+            if cleaned and cleaned not in queries:
+                queries.append(cleaned)
+    for city, items in experience_queries.items():
+        window = window_by_city.get(city, {})
+        arrival = window.get("check_in")
+        departure = window.get("check_out")
+        for item in items[:2]:
+            url = _build_sight_url(city, item, arrival, departure)
+            details = _format_date_range(arrival, departure)
+            _append("sightseeing", item, url, details)
+
+    return links
+
+
+def _build_hotel_url(city: str, check_in: str | None, check_out: str | None, req: TripRequest) -> str:
+    base = "https://www.booking.com/searchresults.html"
+    adults = max(req.party.adults + req.party.seniors, 1)
+    children = max(req.party.children, 0)
+    params = {
+        "ss": city,
+        "group_adults": adults,
+        "group_children": children,
+        "no_rooms": 1,
+    }
+    if check_in:
+        params["checkin"] = check_in
+    if check_out:
+        params["checkout"] = check_out
+    return f"{base}?{urlencode(params)}"
+
+
+def _build_transport_url(leg: TravelLeg, depart_date: str | None) -> str:
+    if leg.mode == "flight":
+        query = f"flights from {leg.frm} to {leg.to}"
+        if depart_date:
+            query += f" on {depart_date}"
+        return f"https://www.google.com/travel/flights?q={quote_plus(query)}"
+
+    base = "https://www.omio.com/search"
+    params = {
+        "departure": leg.frm,
+        "arrival": leg.to,
+    }
+    if depart_date:
+        params["date"] = depart_date
+    if leg.mode in {"train", "bus"}:
+        params["mode"] = leg.mode
+    return f"{base}?{urlencode(params)}"
+
+
+def _build_city_pass_url(city: str, arrival: str | None, departure: str | None) -> str:
+    params = {"q": f"{city} city pass"}
+    if arrival:
+        params["date_from"] = arrival
+    if departure:
+        params["date_to"] = departure
+    return f"https://www.getyourguide.com/s/?{urlencode(params)}"
+
+
+def _build_sight_url(city: str, experience: str, arrival: str | None, departure: str | None) -> str:
+    query = f"{experience} {city} tickets"
+    params = {"q": query}
+    if arrival:
+        params["date_from"] = arrival
+    if departure:
+        params["date_to"] = departure
+    return f"https://www.getyourguide.com/s/?{urlencode(params)}"
+
+
+def _format_date_range(start: str | None, end: str | None, *, suffix: str | None = None) -> str | None:
+    if not start and not end:
+        return suffix.lstrip() if suffix else None
+    parts = []
+    if start:
+        parts.append(start)
+    if end:
+        parts.append(end)
+    details = " → ".join(parts)
+    if suffix:
+        details = f"{details}{suffix}"
+    return details
+
+
+def _infer_stay_windows(
+    req: TripRequest,
+    nights_allocation: List[int],
+    logistics_ctx: Dict[str, Any],
+    foundation_ctx: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    windows: List[Dict[str, str]] = []
+    timeline = []
+    if isinstance(logistics_ctx, dict):
+        timeline = logistics_ctx.get("timeline") or []
+    for entry in timeline:
+        city = entry.get("city")
+        if not city:
+            continue
+        check_in = _coerce_date(entry.get("arrival"))
+        check_out = _coerce_date(entry.get("departure"))
+        windows.append({"city": city, "check_in": check_in, "check_out": check_out})
+
+    if len(windows) == len(req.destinations):
+        return windows
+
+    fallback_start = foundation_ctx.get("dates", {}).get("start") or req.dates.start
+    start_dt = _parse_date(fallback_start)
+    cursor = start_dt
+    fallback: List[Dict[str, str]] = []
+    for city, nights in zip(req.destinations, nights_allocation):
+        nights = max(int(nights or 1), 1)
+        check_in = cursor.date().isoformat() if cursor else None
+        cursor = cursor + timedelta(days=nights) if cursor else None
+        check_out = cursor.date().isoformat() if cursor else None
+        fallback.append({"city": city, "check_in": check_in, "check_out": check_out})
+    if len(fallback) < len(req.destinations):
+        remaining = req.destinations[len(fallback) :]
+        for city in remaining:
+            fallback.append({"city": city, "check_in": None, "check_out": None})
+    return fallback
+
+
+def _coerce_date(value: Any) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value)
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    parsed = _parse_date(text)
+    return parsed.date().isoformat() if parsed else text if text else None
+
+
+def _parse_date(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 def _align_bundle_components(
     stays: List[Stay],
     travel: List[TravelLeg],
