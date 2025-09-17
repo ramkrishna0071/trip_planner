@@ -15,7 +15,8 @@ if not logger.handlers:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
     logger.addHandler(handler)
-logger.setLevel(logging.INFO)
+_level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _level, logging.INFO))
 logger.propagate = False
 
 # Load .env file if present
@@ -56,6 +57,7 @@ Web snippets:
 """
 
 def _build_snippets(snips: List[Dict[str, str]]) -> str:
+    """Format snippets for inclusion in the prompt."""
     parts = []
     for i, d in enumerate(snips, 1):
         parts.append(
@@ -82,6 +84,8 @@ def call_llm(payload: Dict[str, Any], snippets: List[Dict[str, str]], model: str
         logger.info(
             "Skipping LLM call — returning budget-friendly stub payload (missing client or API key)."
         )
+        # The rest of the orchestrator can continue operating with deterministic
+        # data even when the hosted model is not reachable.
         return {
             "llm": "skipped",
             "reason": "missing_openai_client",
@@ -91,6 +95,9 @@ def call_llm(payload: Dict[str, Any], snippets: List[Dict[str, str]], model: str
             },
         }
 
+    logger.info(
+        "Invoking LLM model %s with %d snippets", model, len(snippets)
+    )
     resp = _client.chat.completions.create(
         model=model,
         messages=[
@@ -103,6 +110,9 @@ def call_llm(payload: Dict[str, Any], snippets: List[Dict[str, str]], model: str
 
     raw = resp.choices[0].message.content
     try:
-        return json.loads(raw)  # convert string to dict
+        parsed = json.loads(raw)  # convert string to dict
+        logger.info("LLM JSON payload parsed successfully with keys: %s", ", ".join(sorted(parsed.keys())))
+        return parsed
     except Exception:
+        logger.warning("LLM response was not valid JSON; returning raw text")
         return {"error": "Invalid JSON from model", "raw": raw}
