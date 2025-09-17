@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 import httpx
 import pytest
@@ -61,6 +61,7 @@ async def test_websearch_search_applies_source_policy(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_orchestrator_dedupes_and_fetches_unique_results(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     from app import orchestrator
 
     collected_snippets = {}
@@ -126,3 +127,68 @@ async def test_orchestrator_dedupes_and_fetches_unique_results(monkeypatch):
     assert len(snippets) == 3
     assert {s["url"] for s in snippets} == set(fetch_calls)
     assert collected_snippets["value"] == snippets
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_respects_payload_domain_lists(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    from app import orchestrator
+
+    captured_snippets: Dict[str, List[Dict[str, str]]] = {}
+
+    def fake_call_llm(payload, snippets):
+        captured_snippets["value"] = list(snippets)
+        return {"llm": "ok"}
+
+    monkeypatch.setattr(orchestrator, "call_llm", fake_call_llm)
+
+    instances: List[object] = []
+
+    class FakeSearcher:
+        def __init__(self, policy):
+            self.policy = policy
+            self.search_calls: List[str] = []
+            self.fetch_calls: List[str] = []
+            instances.append(self)
+
+        async def search(self, query: str):
+            self.search_calls.append(query)
+            return [
+                {"url": "https://allowed.com/a", "title": "Allowed"},
+                {"url": "https://denied.com/b", "title": "Denied"},
+                {"url": "https://other.com/c", "title": "Other"},
+            ]
+
+        async def fetch(self, url: str):
+            self.fetch_calls.append(url)
+            return WebDoc(url=url, title=f"Title for {url}", text="Snippet text")
+
+    monkeypatch.setattr(orchestrator, "WebSearcher", FakeSearcher)
+
+    payload = {
+        "origin": "Paris",
+        "destinations": ["Rome", "Milan"],
+        "dates": {"start": "2025-01-01", "end": "2025-01-05"},
+        "budget_total": 2000.0,
+        "currency": "EUR",
+        "party": {"adults": 2},
+        "prefs": {"objective": "balanced"},
+        "allow_domains": r"allowed\.com",
+        "deny_domains": [r"denied\.com"],
+    }
+
+    data = await orchestrator.orchestrate_llm_trip(payload)
+
+    assert instances, "WebSearcher should have been instantiated"
+    policy = instances[0].policy
+    assert list(policy.allow_domains or []) == [r"allowed\.com"]
+    assert list(policy.deny_domains or []) == [r"denied\.com"]
+
+    # Only allowed domain results should pass through.
+    fetch_calls = instances[0].fetch_calls
+    assert fetch_calls == ["https://allowed.com/a"]
+
+    snippets = data.get("snippets")
+    assert snippets is not None
+    assert snippets == [{"url": "https://allowed.com/a", "title": "Title for https://allowed.com/a", "text": "Snippet text"}]
+    assert captured_snippets["value"] == snippets
