@@ -13,6 +13,7 @@ from app.schemas import (
     Stay,
     DayPlan,
     AgentContext,
+    TripPrefs,
 )
 from app.llm import call_llm  # import at module top to avoid circulars
 from app.agents.foundation_agent import extract_foundation
@@ -174,12 +175,27 @@ def plan_trip(
     )
 
     options = [balanced, cheapest, comfort]
-    if req.prefs.objective == "cheapest":
-        options.sort(key=lambda o: o.total_cost)
-    elif req.prefs.objective == "comfort":
-        options.sort(key=lambda o: (o.transfers, -o.total_cost))
-    else:
-        options = [balanced, cheapest, comfort]
+    metrics = [_plan_metrics(bundle, req.budget_total) for bundle in options]
+    base_scores = _build_normalized_scores(metrics)
+
+    scored_options: List[PlanBundle] = []
+    for bundle, metric_snapshot, normalized in zip(options, metrics, base_scores):
+        adjusted = _apply_preferences(bundle, metric_snapshot, normalized, req.prefs)
+        bundle.scores = {
+            "cost": round(adjusted["cost"], 4),
+            "time": round(adjusted["time"], 4),
+            "experience": round(adjusted["experience"], 4),
+            "composite": round(adjusted["composite"], 4),
+            "budget_utilization": round(metric_snapshot["budget_utilization"], 4),
+            "transit_hours": round(metric_snapshot["transit_hours"], 2),
+            "experience_density": round(metric_snapshot["experience_density"], 2),
+            "flight_hours": round(metric_snapshot["flight_hours"], 2),
+            "avg_flex_hours": round(metric_snapshot["avg_flex_hours"], 2),
+        }
+        _attach_score_notes(bundle)
+        scored_options.append(bundle)
+
+    options = sorted(scored_options, key=lambda b: b.scores.get("composite", 0.0), reverse=True)
 
     agent_context_model = AgentContext.model_validate(ctx) if ctx else None
     return TripResponse(query_echo=req, options=options, agent_context=agent_context_model)
@@ -335,3 +351,233 @@ def _days(start: str, end: str) -> int:
     s = datetime.strptime(start, "%Y-%m-%d").date()
     e = datetime.strptime(end, "%Y-%m-%d").date()
     return (e - s).days + 1
+
+
+_DEFAULT_MODE_DURATION = {
+    "train": 3.0,
+    "bus": 4.0,
+    "flight": 2.0,
+    "car": 3.5,
+    "rideshare": 1.2,
+    "metro": 0.6,
+    "walk": 0.4,
+    "ferry": 2.5,
+}
+
+_STAY_STYLE_QUALITY = {
+    "homestay": 0.45,
+    "hotel": 0.65,
+    "apartment": 0.7,
+    "boutique": 0.85,
+}
+
+_OBJECTIVE_WEIGHTS = {
+    "balanced": {"cost": 1.4, "time": 0.6, "experience": 1.2},
+    "cheapest": {"cost": 1.8, "time": 0.6, "experience": 0.6},
+    "comfort": {"cost": 0.8, "time": 1.6, "experience": 1.1},
+    "family_friendly": {"cost": 1.0, "time": 0.9, "experience": 1.5},
+}
+
+_OBJECTIVE_COST_MIX = {
+    "balanced": (0.4, 0.6),
+    "cheapest": (0.25, 0.75),
+    "comfort": (0.8, 0.2),
+    "family_friendly": (0.5, 0.5),
+}
+
+
+def _plan_metrics(bundle: PlanBundle, budget_total: float) -> Dict[str, float]:
+    transit_hours = 0.0
+    flight_hours = 0.0
+    for leg in bundle.travel:
+        duration = leg.duration_hr
+        if duration is None:
+            duration = _DEFAULT_MODE_DURATION.get(leg.mode, 3.0)
+        transit_hours += duration
+        if leg.mode == "flight":
+            flight_hours += duration
+
+    if bundle.experience_plan:
+        total_items = sum(len(day.must_do) + len(day.hidden_gem) for day in bundle.experience_plan)
+        experience_density = total_items / max(1, len(bundle.experience_plan))
+        avg_flex_hours = sum(day.flex_hours for day in bundle.experience_plan) / max(1, len(bundle.experience_plan))
+    else:
+        experience_density = 0.0
+        avg_flex_hours = 0.0
+
+    budget_utilization = bundle.total_cost / budget_total if budget_total else 1.0
+    stay_quality = _avg_stay_quality(bundle.stays)
+
+    return {
+        "budget_utilization": budget_utilization,
+        "transit_hours": transit_hours,
+        "experience_density": experience_density,
+        "flight_hours": flight_hours,
+        "transfers": bundle.transfers,
+        "stay_quality": stay_quality,
+        "avg_flex_hours": avg_flex_hours,
+        "under_budget_ratio": max(0.0, 1.0 - min(budget_utilization, 1.0)),
+    }
+
+
+def _build_normalized_scores(metrics: List[Dict[str, float]]) -> List[Dict[str, float]]:
+    if not metrics:
+        return []
+
+    alignment_vals = [abs(m["budget_utilization"] - 1.0) for m in metrics]
+    savings_vals = [m["budget_utilization"] for m in metrics]
+    avg_util = sum(m["budget_utilization"] for m in metrics) / len(metrics)
+    center_vals = [abs(m["budget_utilization"] - avg_util) for m in metrics]
+    time_vals = [m["transit_hours"] + 0.5 * m["transfers"] for m in metrics]
+    density_vals = [m["experience_density"] for m in metrics]
+    quality_vals = [m["stay_quality"] for m in metrics]
+    flex_vals = [m["avg_flex_hours"] for m in metrics]
+
+    alignment_scores = _normalize(alignment_vals, invert=True)
+    savings_scores = _normalize(savings_vals, invert=True)
+    center_scores = _normalize(center_vals, invert=True)
+    time_scores = _normalize(time_vals, invert=True)
+    density_scores = _normalize(density_vals, invert=False)
+    quality_scores = _normalize(quality_vals, invert=False)
+    flex_scores = _normalize(flex_vals, invert=False)
+
+    base: List[Dict[str, float]] = []
+    for idx in range(len(metrics)):
+        experience_score = _clamp(0.6 * density_scores[idx] + 0.4 * quality_scores[idx])
+        base.append(
+            {
+                "cost_alignment": alignment_scores[idx],
+                "cost_savings": savings_scores[idx],
+                "cost_center": center_scores[idx],
+                "time": time_scores[idx],
+                "experience": experience_score,
+                "quality": quality_scores[idx],
+                "flex": flex_scores[idx],
+            }
+        )
+    return base
+
+
+def _apply_preferences(
+    bundle: PlanBundle,
+    metrics: Dict[str, float],
+    base_scores: Dict[str, float],
+    prefs: TripPrefs,
+) -> Dict[str, float]:
+    cost_mix = _OBJECTIVE_COST_MIX.get(prefs.objective, _OBJECTIVE_COST_MIX["balanced"])
+    cost_score = _blend(base_scores["cost_alignment"], base_scores["cost_savings"], cost_mix)
+    time_score = base_scores["time"]
+    experience_score = base_scores["experience"]
+    quality_score = base_scores["quality"]
+    flex_score = base_scores["flex"]
+    center_score = base_scores.get("cost_center", cost_score)
+
+    weights = dict(_OBJECTIVE_WEIGHTS.get(prefs.objective, _OBJECTIVE_WEIGHTS["balanced"]))
+
+    if prefs.objective == "cheapest":
+        cost_score = _clamp(cost_score + metrics.get("under_budget_ratio", 0.0) * 0.7)
+        time_score = min(time_score, 0.8)
+    elif prefs.objective == "comfort":
+        time_score = _clamp(time_score + quality_score * 0.15)
+        experience_score = _clamp(experience_score + quality_score * 0.2)
+    elif prefs.objective == "family_friendly":
+        experience_score = _clamp(experience_score + flex_score * 0.25)
+        time_score = _clamp(time_score + flex_score * 0.1)
+    elif prefs.objective == "balanced":
+        cost_score = _clamp(0.5 * cost_score + 0.5 * center_score)
+        time_score = max(time_score, 0.4)
+
+    if prefs.flexible_days:
+        weights["time"] *= 1.0 / (1.0 + 0.05 * prefs.flexible_days)
+        experience_score = _clamp(experience_score + min(0.15, 0.02 * prefs.flexible_days))
+
+    if prefs.diet:
+        weights["experience"] *= 1.0 + min(0.5, 0.1 * len(prefs.diet))
+
+    if prefs.mobility == "step_free":
+        penalty = min(0.6, 0.12 * metrics.get("transfers", 0.0))
+        time_score = _clamp(time_score * (1.0 - penalty))
+        weights["time"] *= 1.25
+    elif prefs.mobility == "low_stairs":
+        penalty = min(0.4, 0.08 * metrics.get("transfers", 0.0))
+        time_score = _clamp(time_score * (1.0 - penalty))
+        weights["time"] *= 1.1
+
+    if prefs.max_flight_hours is not None:
+        if metrics.get("flight_hours", 0.0) > prefs.max_flight_hours:
+            over_ratio = (metrics["flight_hours"] - prefs.max_flight_hours) / max(prefs.max_flight_hours, 1.0)
+            penalty = min(0.9, over_ratio * 0.5 + 0.2)
+            time_score = _clamp(time_score * (1.0 - penalty))
+            experience_score = _clamp(experience_score * (1.0 - penalty * 0.5))
+            cost_score = _clamp(cost_score * (1.0 - penalty * 0.3))
+            weights["time"] *= 1.1
+
+    total_weight = sum(weights.values()) or 1.0
+    composite = (
+        weights["cost"] * cost_score
+        + weights["time"] * time_score
+        + weights["experience"] * experience_score
+    ) / total_weight
+
+    return {
+        "cost": cost_score,
+        "time": time_score,
+        "experience": experience_score,
+        "composite": composite,
+    }
+
+
+def _attach_score_notes(bundle: PlanBundle) -> None:
+    if not bundle.scores:
+        return
+
+    score_text = (
+        f"Scores — cost {bundle.scores.get('cost', 0.0):.2f}, "
+        f"time {bundle.scores.get('time', 0.0):.2f}, "
+        f"experience {bundle.scores.get('experience', 0.0):.2f}, "
+        f"overall {bundle.scores.get('composite', 0.0):.2f}."
+    )
+    if "Scores —" not in bundle.summary:
+        summary_base = bundle.summary.rstrip()
+        if not summary_base.endswith("."):
+            summary_base = f"{summary_base}."
+        bundle.summary = f"{summary_base} {score_text}"
+
+    note_text = (
+        f"Metrics → transit_hours={bundle.scores.get('transit_hours', 0.0):.2f}, "
+        f"budget_utilization={bundle.scores.get('budget_utilization', 0.0):.2f}, "
+        f"experience_density={bundle.scores.get('experience_density', 0.0):.2f}"
+    )
+    if note_text not in bundle.notes:
+        bundle.notes.append(note_text)
+
+
+def _normalize(values: List[float], *, invert: bool) -> List[float]:
+    if not values:
+        return []
+    min_val = min(values)
+    max_val = max(values)
+    if max_val - min_val < 1e-9:
+        return [1.0 for _ in values]
+    scaled = [(val - min_val) / (max_val - min_val) for val in values]
+    if invert:
+        scaled = [1.0 - s for s in scaled]
+    baseline = 0.2
+    return [_clamp(baseline + (1.0 - baseline) * s) for s in scaled]
+
+
+def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
+    return max(low, min(high, value))
+
+
+def _avg_stay_quality(stays: List[Stay]) -> float:
+    if not stays:
+        return 0.6
+    total = sum(_STAY_STYLE_QUALITY.get(stay.style, 0.6) for stay in stays)
+    return total / len(stays)
+
+
+def _blend(alignment: float, savings: float, mix: tuple[float, float]) -> float:
+    a, b = mix
+    denom = (a + b) or 1.0
+    return _clamp((alignment * a + savings * b) / denom)

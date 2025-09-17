@@ -72,6 +72,7 @@ class PlanBundle(BaseModel):
     notes: List[str] = Field(default_factory=list)               # [] -> default_factory
     feasibility_notes: List[str] = Field(default_factory=list)
     transfer_buffers: Dict[str, float] = Field(default_factory=dict)
+    scores: Dict[str, float] = Field(default_factory=dict)
 
 class TripResponse(BaseModel):
     query_echo: TripRequest
