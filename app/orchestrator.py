@@ -34,7 +34,7 @@ def plan_trip(req: TripRequest) -> TripResponse:
     nights = max(1, trip_days - 1)
     n_stops = max(1, len(req.destinations))
     nights_each = _split_nights(nights, n_stops)
-    ppd_val = _ppd(req.budget, trip_days, party_size)
+    ppd_val = _ppd(req.budget_total, trip_days, party_size)
 
     stays = [
         Stay(city=city, nights=n, style="hotel", budget_per_night=ppd_val * 0.4 * party_size)
@@ -118,16 +118,20 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
                                allow_domains: List[str] | None = None,
                                deny_domains: List[str] | None = None) -> Dict[str, Any]:
     """Build queries, optionally web-search + fetch snippets, call LLM, return dict."""
+    trip_req = TripRequest.model_validate(payload)
+    baseline_plan = plan_trip(trip_req)
+    baseline_dump = baseline_plan.model_dump(mode="json")
+
     # Build queries from payload
     queries: List[str] = []
-    dests: List[str] = payload.get("destinations", []) or []
+    dests: List[str] = trip_req.destinations
     if len(dests) >= 2:
         for a, b in zip(dests[:-1], dests[1:]):
             queries.append(f"how to travel {a} to {b} train flight bus cost")
     for c in dests[:3]:
         queries += [f"top attractions {c} family friendly", f"{c} city pass prices"]
     if dests:
-        origin = payload.get("origin", "")
+        origin = trip_req.origin
         queries.append(f"visa requirements {origin} to {dests[-1]} official")
 
     # Build snippets (empty if WebSearcher not available)
@@ -163,9 +167,25 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
                 snippets.append({"url": d.url, "title": getattr(d, "title", "") or "", "text": getattr(d, "text", "") or ""})
 
     # Call LLM (your llm.py returns a dict already)
-    data = call_llm(payload, snippets)
-    # Ensure it’s a dict for FastAPI
-    return data
+    try:
+        data = call_llm(payload, snippets)
+    except Exception as exc:
+        return {
+            "baseline_plan": baseline_dump,
+            "snippets": snippets,
+            "llm_error": str(exc),
+        }
+
+    if isinstance(data, dict):
+        data.setdefault("baseline_plan", baseline_dump)
+        data.setdefault("snippets", snippets)
+        return data
+
+    return {
+        "llm_raw": data,
+        "baseline_plan": baseline_dump,
+        "snippets": snippets,
+    }
 
 # ---------- helpers ----------
 def _split_nights(total_nights: int, n_stops: int) -> List[int]:
@@ -174,8 +194,8 @@ def _split_nights(total_nights: int, n_stops: int) -> List[int]:
         base[i] += 1
     return base
 
-def _ppd(budget: float, days: int, party_size: int) -> float:
-    return max(1.0, budget / max(1, days) / max(1, party_size))
+def _ppd(budget_total: float, days: int, party_size: int) -> float:
+    return max(1.0, budget_total / max(1, days) / max(1, party_size))
 
 def _day_plans(cities: List[str], nights_each: List[int]) -> List[DayPlan]:
     out: List[DayPlan] = []

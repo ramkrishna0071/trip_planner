@@ -1,5 +1,5 @@
 from typing import List, Dict, Literal, Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, AliasChoices, ConfigDict
 
 # ------- Request models -------
 class TripPrefs(BaseModel):
@@ -19,10 +19,12 @@ class Dates(BaseModel):
     end: str
 
 class TripRequest(BaseModel):
+    model_config = ConfigDict(extra="ignore", populate_by_name=True)
+
     origin: str
     destinations: List[str]
     dates: Dates
-    budget: float
+    budget_total: float = Field(..., validation_alias=AliasChoices("budget_total", "budget"))
     currency: str = "USD"
     party: Party = Party()
     prefs: TripPrefs = TripPrefs()
