@@ -57,6 +57,8 @@ class AgentContext(BaseModel):
     notes: List[str] = Field(default_factory=list)
     sources: List[Dict[str, str]] = Field(default_factory=list)
     snippets: List[Dict[str, str]] = Field(default_factory=list)
+    costs: Dict[str, object] = Field(default_factory=dict)
+    llm_sources: List[Dict[str, object]] = Field(default_factory=list)
 
 class PlanBundle(BaseModel):
     label: Literal["balanced","cheapest","comfort","family_friendly"]

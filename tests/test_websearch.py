@@ -86,6 +86,7 @@ def test_websearch_search_applies_source_policy(monkeypatch):
         assert len(results) == 2  # allowed.com and first other.com entry
         assert {r["url"] for r in results} == {"https://allowed.com/a", "https://other.com/1"}
         assert all(r["title"] for r in results)
+        assert all("content" in r for r in results)
 
     asyncio.run(run())
 
@@ -157,6 +158,7 @@ def test_orchestrator_dedupes_and_fetches_unique_results(monkeypatch):
         assert snippets is not None
         assert len(snippets) == 3
         assert {s["url"] for s in snippets} == set(fetch_calls)
+        assert all(s.get("source") == "web_fetch" for s in snippets)
         assert collected_snippets["value"] == snippets
 
     asyncio.run(run())
@@ -224,7 +226,12 @@ def test_orchestrator_respects_payload_domain_lists(monkeypatch):
         snippets = data.get("snippets")
         assert snippets is not None
         assert snippets == [
-            {"url": "https://allowed.com/a", "title": "Title for https://allowed.com/a", "text": "Snippet text"}
+            {
+                "url": "https://allowed.com/a",
+                "title": "Title for https://allowed.com/a",
+                "text": "Snippet text",
+                "source": "web_fetch",
+            }
         ]
         assert captured_snippets["value"] == snippets
 
@@ -270,5 +277,60 @@ def test_orchestrator_foundation_preserves_user_extras(monkeypatch):
         assert captured_ctx is not None
         assert captured_ctx.get("foundation", {}).get("interests") == payload["interests"]
         assert captured_ctx.get("foundation", {}).get("constraints") == payload["constraints"]
+
+    asyncio.run(run())
+
+
+def test_orchestrator_llm_backfill_updates_destination(monkeypatch):
+    async def run() -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        from app import orchestrator
+
+        def fake_call_llm(payload, snippets):
+            return {"llm": "ok"}
+
+        monkeypatch.setattr(orchestrator, "call_llm", fake_call_llm)
+        monkeypatch.setattr(orchestrator, "WebSearcher", None)
+
+        captured_cities: Dict[str, Any] = {}
+
+        def fake_llm_backfill(cities, foundation, model="gpt-4o-mini"):
+            captured_cities["value"] = {"cities": list(cities), "model": model}
+            return {
+                "Paris": {
+                    "highlights": ["LLM highlight"],
+                    "experiences": ["LLM experience"],
+                    "dining": ["LLM dining"],
+                    "notes": ["Indicative: LLM note"],
+                }
+            }
+
+        monkeypatch.setattr(orchestrator, "llm_backfill_city_details", fake_llm_backfill)
+
+        payload = {
+            "origin": "Lisbon",
+            "destinations": ["Paris"],
+            "dates": {"start": "2025-03-01", "end": "2025-03-05"},
+            "budget_total": 1800.0,
+            "currency": "EUR",
+            "party": {"adults": 2, "children": 1},
+            "prefs": {"objective": "balanced"},
+        }
+
+        data = await orchestrator.orchestrate_llm_trip(payload)
+
+        assert captured_cities["value"]["cities"] == ["Paris"]
+        agent_context = data.get("agent_context")
+        assert agent_context is not None
+        destinations = agent_context.get("destinations")
+        assert destinations
+        assert destinations[0]["highlights"] == ["LLM highlight"]
+        assert destinations[0]["experiences"] == ["LLM experience"]
+        assert destinations[0]["dining"] == ["LLM dining"]
+        assert agent_context.get("llm_sources")
+        assert any(src.get("model") == captured_cities["value"]["model"] for src in agent_context["llm_sources"])
+        assert "llm://" in " ".join(data.get("source_links", []))
+        costs = agent_context.get("costs")
+        assert costs and set(["stays", "transport", "food", "total", "budget"]).issubset(costs.keys())
 
     asyncio.run(run())

@@ -8,6 +8,17 @@ import httpx
 
 from .html_to_text import html_to_text
 
+import logging
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+_level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _level, logging.INFO))
+logger.propagate = False
+
 @dataclass
 class SourcePolicy:
     allow_domains: Optional[Sequence[str]] = None
@@ -44,10 +55,10 @@ class WebSearcher:
     async def search(self, query: str) -> List[Dict]:
         """Run a Tavily search and return filtered results.
 
-        The returned payload only contains ``url`` + ``title`` pairs because the
-        orchestrator performs its own fetching step for snippets.  Results are
-        pre-filtered according to the configured ``SourcePolicy`` so callers do
-        not have to re-apply allow/deny logic.
+        The returned payload includes the ``url``, ``title`` and any provider
+        summary text so the orchestrator can fall back to those snippets when a
+        direct fetch fails. Results are pre-filtered according to the configured
+        ``SourcePolicy`` so callers do not have to re-apply allow/deny logic.
         """
         if not self.api_key:
             raise RuntimeError("TAVILY_API_KEY environment variable not configured")
@@ -84,6 +95,7 @@ class WebSearcher:
                 title = self._title_from_html(r.text) or url
                 return WebDoc(url=url, title=title, text=text)
         except Exception:
+            logger.warning("Failed to fetch url %s", url, exc_info=True)
             return None
 
     @staticmethod
@@ -114,7 +126,8 @@ class WebSearcher:
                 continue
 
             title = result.get("title") or ""
-            filtered.append({"url": url, "title": title})
+            snippet = result.get("content") or result.get("snippet") or ""
+            filtered.append({"url": url, "title": title, "content": snippet})
             seen_urls.add(url)
             per_domain[domain] = per_domain.get(domain, 0) + 1
 

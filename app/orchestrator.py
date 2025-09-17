@@ -18,7 +18,7 @@ from app.schemas import (
     AgentContext,
     TripPrefs,
 )
-from app.llm import call_llm  # import at module top to avoid circulars
+from app.llm import call_llm, llm_backfill_city_details  # import at module top to avoid circulars
 from app.agents.foundation_agent import extract_foundation
 from app.agents.destination_scout import expand_destinations
 from app.agents.logistics_planner import compute_logistics
@@ -156,6 +156,26 @@ def plan_trip(
         baseline_total,
         req.currency,
         req.budget_total,
+    )
+
+    budget_delta = baseline_total - req.budget_total
+    ctx["costs"] = {
+        "currency": req.currency,
+        "stays": round(base_cost_stay, 2),
+        "transport": round(base_cost_move, 2),
+        "food": round(food_misc, 2),
+        "other": 0.0,
+        "total": round(baseline_total, 2),
+        "budget": req.budget_total,
+        "delta": round(budget_delta, 2),
+        "status": "over" if budget_delta > 0 else "under" if budget_delta < 0 else "on_budget",
+    }
+    logger.info(
+        "Budget comparison — baseline total %.2f vs budget %.2f (%s %.2f)",
+        baseline_total,
+        req.budget_total,
+        "over by" if budget_delta > 0 else "under by" if budget_delta < 0 else "aligned with",
+        abs(budget_delta),
     )
 
     _extend_unique(combined_notes, _suggest_date_shifts(req, trip_days, baseline_total))
@@ -363,11 +383,43 @@ async def orchestrate_llm_trip(
             per_domain[dom] = per_domain.get(dom, 0) + 1
             pruned.append(r)
         # FETCH
-        fetch_tasks = [searcher.fetch(r["url"]) for r in pruned[:policy.max_results]]
-        docs = await asyncio.gather(*fetch_tasks, return_exceptions=True)
-        for d in docs:
-            if getattr(d, "url", None):
-                snippets.append({"url": d.url, "title": getattr(d, "title", "") or "", "text": getattr(d, "text", "") or ""})
+        fetch_targets = pruned[:policy.max_results]
+        docs = await asyncio.gather(*[searcher.fetch(r["url"]) for r in fetch_targets], return_exceptions=True)
+        failed_urls: List[str] = []
+        fallback_count = 0
+        for payload, doc in zip(fetch_targets, docs):
+            if isinstance(doc, Exception):
+                failed_urls.append(payload.get("url", ""))
+                logger.warning("Fetcher raised for %s", payload.get("url"), exc_info=True)
+                doc = None
+            if getattr(doc, "url", None):
+                snippets.append(
+                    {
+                        "url": doc.url,
+                        "title": getattr(doc, "title", "") or "",
+                        "text": getattr(doc, "text", "") or "",
+                        "source": "web_fetch",
+                    }
+                )
+                continue
+            snippet_text = payload.get("content") or ""
+            if snippet_text:
+                snippets.append(
+                    {
+                        "url": payload.get("url", ""),
+                        "title": payload.get("title", "") or "",
+                        "text": snippet_text,
+                        "source": "search_summary",
+                    }
+                )
+                fallback_count += 1
+            else:
+                failed_urls.append(payload.get("url", ""))
+        if fallback_count:
+            logger.info("Populated %d snippet(s) from search result summaries", fallback_count)
+        if failed_urls:
+            dedup_failures = sorted({url for url in failed_urls if url})
+            logger.warning("Unable to assemble snippets for %d url(s): %s", len(dedup_failures), ", ".join(dedup_failures))
         logger.info(
             "Collected %d unique snippets from %d raw hits (allowed domains: %s)",
             len(snippets),
@@ -379,6 +431,85 @@ async def orchestrate_llm_trip(
 
     # Derive richer context from specialised agents.
     destination_context = expand_destinations(foundation, snippets)
+
+    llm_sources: List[Dict[str, Any]] = []
+    heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
+    if heuristic_cities:
+        missing_details: List[str] = []
+        for city in heuristic_cities:
+            dest_entry = next(
+                (d for d in destination_context.get("destinations", []) if d.get("city") == city),
+                {},
+            )
+            missing_fields: List[str] = []
+            if not dest_entry.get("highlights"):
+                missing_fields.append("highlights")
+            if not dest_entry.get("experiences"):
+                missing_fields.append("experiences")
+            if not dest_entry.get("dining"):
+                missing_fields.append("dining")
+            if missing_fields:
+                missing_details.append(f"{city}: {', '.join(missing_fields)}")
+        if missing_details:
+            logger.warning("Missing destination intel from web snippets — %s", "; ".join(missing_details))
+
+        backfill_model = (
+            payload.get("llm_backfill_model")
+            or payload.get("llm_model")
+            or os.getenv("TRIP_PLANNER_FALLBACK_MODEL")
+            or "gpt-4o-mini"
+        )
+        backfill_data = llm_backfill_city_details(heuristic_cities, foundation, model=backfill_model)
+        if backfill_data:
+            dest_notes = destination_context.setdefault("notes", []) or []
+            for city, data in backfill_data.items():
+                dest_entry = next(
+                    (d for d in destination_context.get("destinations", []) if d.get("city") == city),
+                    None,
+                )
+                if not dest_entry:
+                    continue
+                filled_fields: List[str] = []
+                for key in ("highlights", "experiences", "dining"):
+                    values = data.get(key)
+                    if values:
+                        dest_entry[key] = values
+                        filled_fields.append(key)
+                if filled_fields:
+                    dest_entry["source"] = "llm"
+                if data.get("notes"):
+                    _extend_unique(dest_notes, data["notes"])
+                    if not filled_fields:
+                        filled_fields.append("notes")
+                if filled_fields:
+                    llm_sources.append({"city": city, "model": backfill_model, "fields": filled_fields})
+            if llm_sources:
+                updated_cities = ", ".join(sorted({entry["city"] for entry in llm_sources}))
+                info_note = f"LLM fallback ({backfill_model}) supplied destination intel for: {updated_cities}."
+                _extend_unique(destination_context.setdefault("notes", []), [info_note])
+                dest_source_bucket = destination_context.setdefault("sources", [])
+                for entry in llm_sources:
+                    dest_source_bucket.append(
+                        {
+                            "city": entry["city"],
+                            "title": f"{entry['city']} fallback via {backfill_model}",
+                            "url": f"llm://{backfill_model}",
+                            "fields": ", ".join(entry["fields"]),
+                        }
+                    )
+                logger.info("LLM backfill (%s) provided destination data for %s", backfill_model, updated_cities)
+        else:
+            logger.warning(
+                "LLM backfill unavailable; retaining heuristic destination highlights for %s",
+                ", ".join(heuristic_cities),
+            )
+            _extend_unique(
+                destination_context.setdefault("notes", []),
+                [
+                    "Heuristic destination highlights retained due to unavailable LLM backfill.",
+                ],
+            )
+
     logistics_context = compute_logistics(foundation)
 
     aggregated_notes = list({note: None for note in (
@@ -389,6 +520,8 @@ async def orchestrate_llm_trip(
 
     # Promote the snippet URLs so downstream consumers can surface citations.
     source_links = sorted({snip["url"] for snip in snippets if snip.get("url")})
+    if llm_sources:
+        source_links = sorted({*source_links, *(f"llm://{entry['model']}" for entry in llm_sources)})
 
     agent_context: Dict[str, Any] = {
         "foundation": foundation,
@@ -398,10 +531,13 @@ async def orchestrate_llm_trip(
         "sources": destination_context.get("sources", []),
         "snippets": snippets,
         "source_links": source_links,
+        "llm_sources": llm_sources,
     }
 
     # Produce the deterministic baseline plan. The LLM later layers narrative.
     baseline_plan = plan_trip(trip_req, agent_context)
+    if baseline_plan.agent_context and getattr(baseline_plan.agent_context, "costs", None):
+        agent_context["costs"] = baseline_plan.agent_context.costs
     baseline_dump = baseline_plan.model_dump(mode="json")
     baseline_dump["source_links"] = source_links
     logger.info(
