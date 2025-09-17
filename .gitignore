@@ -76,3 +76,11 @@ dmypy.json
 *.tmp
 *.orig
 
+# ------------------------------
+# Node / front-end
+# ------------------------------
+node_modules/
+*.tsbuildinfo
+dist-ssr/
+*.vite.config.ts.timestamp
+

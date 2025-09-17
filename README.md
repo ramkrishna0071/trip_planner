@@ -88,5 +88,6 @@ All new features should include coverage in `tests/` where practical.
 - `app/llm.py` – wrapper around the OpenAI client with graceful fallbacks.
 - `app/agents/` – specialised heuristics for foundation, destination, and logistics insights.
 - `debug_orchestrator.py` – quick entry point for manual experiments.
+- `trip_planner_frontend/` – React + Vite workspace that mirrors conversational planners and surfaces booking links alongside orchestrator bundles. See its README for setup instructions.
 
 Happy trip planning!
