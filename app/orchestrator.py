@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from typing import List, Dict, Any
+from collections.abc import Iterable
 from datetime import datetime
 import asyncio
 
@@ -208,6 +209,34 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
     foundation = extract_foundation(payload)
     trip_req = TripRequest.model_validate(payload)
 
+    if "interests" in payload:
+        raw_interests = payload.get("interests")
+        if isinstance(raw_interests, str):
+            foundation["interests"] = [raw_interests]
+        elif isinstance(raw_interests, Iterable):
+            foundation["interests"] = [str(item) for item in raw_interests if item is not None]
+        else:
+            foundation["interests"] = [str(raw_interests)] if raw_interests is not None else []
+
+    if "constraints" in payload:
+        raw_constraints = payload.get("constraints")
+        if isinstance(raw_constraints, dict):
+            foundation["constraints"] = raw_constraints
+        elif raw_constraints is None:
+            foundation["constraints"] = {}
+        else:
+            try:
+                foundation["constraints"] = dict(raw_constraints)
+            except Exception:
+                foundation["constraints"] = {"value": raw_constraints}
+
+    resolved_allow = _normalize_domain_list(
+        allow_domains if allow_domains is not None else payload.get("allow_domains")
+    )
+    resolved_deny = _normalize_domain_list(
+        deny_domains if deny_domains is not None else payload.get("deny_domains")
+    )
+
     # Build queries from payload
     queries: List[str] = []
     dests: List[str] = list(foundation.get("destinations", [])) or trip_req.destinations
@@ -223,7 +252,12 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
     # Build snippets (empty if WebSearcher not available)
     snippets: List[Dict[str, str]] = []
     if WebSearcher is not None:
-        policy = SourcePolicy(allow_domains=allow_domains, deny_domains=deny_domains, max_results=6, max_per_domain=2)
+        policy = SourcePolicy(
+            allow_domains=resolved_allow,
+            deny_domains=resolved_deny,
+            max_results=6,
+            max_per_domain=2,
+        )
         searcher = WebSearcher(policy)
         # SEARCH
         results: List[Dict[str, str]] = []
@@ -300,6 +334,16 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
     }
 
 # ---------- helpers ----------
+def _normalize_domain_list(domains: Any | Iterable | None) -> List[str]:
+    if domains is None:
+        return []
+    if isinstance(domains, str):
+        return [domains]
+    if isinstance(domains, Iterable):
+        return [str(item) for item in domains if item is not None]
+    return [str(domains)]
+
+
 def _split_nights(total_nights: int, n_stops: int) -> List[int]:
     base = [total_nights // n_stops] * n_stops
     for i in range(total_nights % n_stops):
