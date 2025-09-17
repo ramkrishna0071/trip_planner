@@ -1,10 +1,11 @@
 # app/orchestrator.py
 from __future__ import annotations
 
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from collections.abc import Iterable
 from datetime import datetime
 import asyncio
+import logging
 
 from app.schemas import (
     TripRequest,
@@ -20,6 +21,14 @@ from app.llm import call_llm  # import at module top to avoid circulars
 from app.agents.foundation_agent import extract_foundation
 from app.agents.destination_scout import expand_destinations
 from app.agents.logistics_planner import compute_logistics
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # If your websearch tool isn't ready, these imports will be skipped gracefully.
 try:
@@ -81,6 +90,17 @@ def plan_trip(
     party_size = req.party.adults + req.party.children + req.party.seniors
     ppd_val = float(foundation_ctx.get("budget", {}).get("per_person_per_day") or _ppd(req.budget_total, trip_days, party_size))
 
+    logger.info(
+        "Planning trip for %s travellers from %s visiting %s between %s and %s with budget %.2f %s",
+        party_size,
+        req.origin,
+        ", ".join(req.destinations) or req.origin,
+        req.dates.start,
+        req.dates.end,
+        req.budget_total,
+        req.currency,
+    )
+
     stays = [
         Stay(city=city, nights=n, style="hotel", budget_per_night=ppd_val * 0.4 * party_size)
         for city, n in zip(req.destinations, nights_allocation)
@@ -112,70 +132,93 @@ def plan_trip(
     base_cost_stay = sum(s.nights * s.budget_per_night for s in stays)
     base_cost_move = sum(l.cost_estimate or 0 for l in intercity)
     food_misc = trip_days * party_size * ppd_val * 0.35
+    baseline_total = base_cost_stay + base_cost_move + food_misc
+    logger.info(
+        "Baseline composition — stays %.2f, transport %.2f, food %.2f (total %.2f %s) against budget %.2f",
+        base_cost_stay,
+        base_cost_move,
+        food_misc,
+        baseline_total,
+        req.currency,
+        req.budget_total,
+    )
+
+    _extend_unique(combined_notes, _suggest_date_shifts(req, trip_days, baseline_total))
+
+    transfer_buffers = dict(logistics_ctx.get("transfer_buffers", {}))
+    base_experiences = [day.model_copy(deep=True) for day in experiences]
 
     cheapest_stays = [
         Stay(**{**s.model_dump(), "style": "homestay", "budget_per_night": s.budget_per_night * 0.75})
         for s in stays
     ]
-    cheapest = PlanBundle(
-        label="cheapest",
-        summary="Minimize cost using homestays and public transport.",
-        total_cost=base_cost_move + sum(s.nights * s.budget_per_night for s in cheapest_stays) + food_misc * 0.9,
-        currency=req.currency,
-        transfers=max(1, len(intercity)),
-        est_duration_days=trip_days,
-        travel=[*intercity],
-        stays=cheapest_stays,
-        local_transport=["metro/day-pass", "bus", "rideshare (as needed)"],
-        experience_plan=experiences,
-        notes=["Indicative prices; replace with live quotes when adapters are connected."] + combined_notes,
-        feasibility_notes=combined_notes,
-        transfer_buffers=dict(logistics_ctx.get("transfer_buffers", {})),
-    )
 
-    comfort_legs = [
-        (TravelLeg(mode="flight", **{"from": l.frm, "to": l.to}, duration_hr=1.0,
-                   cost_estimate=(l.cost_estimate or 80) * 2.2) if l.mode in ("train", "bus") else l)
-        for l in intercity
+    options: List[PlanBundle] = [
+        _build_plan_bundle(
+            label="balanced",
+            summary="Balanced cost, pace and comfort.",
+            stays=[stay.model_copy(deep=True) for stay in stays],
+            travel=[leg.model_copy(deep=True) for leg in intercity],
+            other_cost=food_misc,
+            req=req,
+            trip_days=trip_days,
+            combined_notes=combined_notes,
+            base_notes=["Good default; tune by preferences (diet, mobility)."],
+            local_transport=["metro", "IC card", "occasional rideshare"],
+            experience_plan=[day.model_copy(deep=True) for day in base_experiences],
+            transfer_buffers=transfer_buffers,
+            transfer_override=len(intercity),
+        ),
+        _build_plan_bundle(
+            label="cheapest",
+            summary="Minimize cost using homestays and public transport.",
+            stays=[stay.model_copy(deep=True) for stay in cheapest_stays],
+            travel=[leg.model_copy(deep=True) for leg in intercity],
+            other_cost=food_misc * 0.9,
+            req=req,
+            trip_days=trip_days,
+            combined_notes=combined_notes,
+            base_notes=[
+                "Lean on homestays, flexible dates, and public transport to stretch the budget.",
+                "Indicative prices; replace with live quotes when adapters are connected.",
+            ],
+            local_transport=["metro/day-pass", "bus", "rideshare (as needed)"],
+            experience_plan=[day.model_copy(deep=True) for day in base_experiences],
+            transfer_buffers=transfer_buffers,
+            transfer_override=max(1, len(intercity)),
+        ),
+        _build_plan_bundle(
+            label="comfort",
+            summary="Fewer transfers, faster hops, nicer stays.",
+            stays=[
+                Stay(**{**s.model_dump(), "style": "boutique", "budget_per_night": s.budget_per_night * 1.5})
+                for s in stays
+            ],
+            travel=[
+                (
+                    TravelLeg(
+                        mode="flight",
+                        **{"from": leg.frm, "to": leg.to},
+                        duration_hr=1.0,
+                        cost_estimate=(leg.cost_estimate or 80.0) * 2.2,
+                    )
+                    if leg.mode in ("train", "bus")
+                    else leg.model_copy(deep=True)
+                )
+                for leg in intercity
+            ],
+            other_cost=food_misc * 1.1,
+            req=req,
+            trip_days=trip_days,
+            combined_notes=combined_notes,
+            base_notes=["Upgrade selected hops to flights; swap stays to boutique."],
+            local_transport=["hotel pickup", "metro", "rideshare"],
+            experience_plan=[day.model_copy(deep=True) for day in base_experiences],
+            transfer_buffers=transfer_buffers,
+            transfer_override=len(intercity),
+        ),
     ]
-    comfort_stays = [
-        Stay(**{**s.model_dump(), "style": "boutique", "budget_per_night": s.budget_per_night * 1.5})
-        for s in stays
-    ]
-    comfort = PlanBundle(
-        label="comfort",
-        summary="Fewer transfers, faster hops, nicer stays.",
-        total_cost=sum(s.nights * s.budget_per_night for s in comfort_stays)
-                   + sum(l.cost_estimate or 0 for l in comfort_legs) + food_misc * 1.1,
-        currency=req.currency,
-        transfers=max(0, len(comfort_legs)),
-        est_duration_days=trip_days,
-        travel=comfort_legs,
-        stays=comfort_stays,
-        local_transport=["hotel pickup", "metro", "rideshare"],
-        experience_plan=experiences,
-        notes=["Upgrade selected hops to flights; swap stays to boutique."] + combined_notes,
-        feasibility_notes=combined_notes,
-        transfer_buffers=dict(logistics_ctx.get("transfer_buffers", {})),
-    )
 
-    balanced = PlanBundle(
-        label="balanced",
-        summary="Balanced cost, pace and comfort.",
-        total_cost=base_cost_stay + base_cost_move + food_misc,
-        currency=req.currency,
-        transfers=len(intercity),
-        est_duration_days=trip_days,
-        travel=intercity,
-        stays=stays,
-        local_transport=["metro", "IC card", "occasional rideshare"],
-        experience_plan=experiences,
-        notes=["Good default; tune by preferences (diet, mobility)."] + combined_notes,
-        feasibility_notes=combined_notes,
-        transfer_buffers=dict(logistics_ctx.get("transfer_buffers", {})),
-    )
-
-    options = [balanced, cheapest, comfort]
     metrics = [_plan_metrics(bundle, req.budget_total) for bundle in options]
     base_scores = _build_normalized_scores(metrics)
 
@@ -206,6 +249,14 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
                                allow_domains: List[str] | None = None,
                                deny_domains: List[str] | None = None) -> Dict[str, Any]:
     """Build queries, optionally web-search + fetch snippets, call LLM, return dict."""
+    logger.info(
+        "Orchestration start: origin=%s, destinations=%s, dates=%s-%s, budget=%s", 
+        payload.get("origin"),
+        payload.get("destinations"),
+        payload.get("dates", {}).get("start") if isinstance(payload.get("dates"), dict) else None,
+        payload.get("dates", {}).get("end") if isinstance(payload.get("dates"), dict) else None,
+        payload.get("budget_total") or payload.get("budget"),
+    )
     foundation = extract_foundation(payload)
     trip_req = TripRequest.model_validate(payload)
 
@@ -266,6 +317,7 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
                 hits = await searcher.search(q)
                 results.extend(hits)
             except Exception:
+                logger.warning("Search failed for query '%s'", q, exc_info=True)
                 continue
         # DEDUPE / FILTER
         seen, per_domain, pruned = set(), {}, []
@@ -285,6 +337,8 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
         for d in docs:
             if getattr(d, "url", None):
                 snippets.append({"url": d.url, "title": getattr(d, "title", "") or "", "text": getattr(d, "text", "") or ""})
+    else:
+        logger.info("WebSearcher unavailable; continuing with heuristic planning only")
 
     destination_context = expand_destinations(foundation, snippets)
     logistics_context = compute_logistics(foundation)
@@ -311,8 +365,10 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
     try:
         enriched_payload = dict(payload)
         enriched_payload["agent_context"] = agent_context
+        logger.info("Calling LLM with %d snippets", len(snippets))
         data = call_llm(enriched_payload, snippets)
     except Exception as exc:
+        logger.exception("LLM call failed: %s", exc)
         return {
             "baseline_plan": baseline_dump,
             "snippets": snippets,
@@ -342,6 +398,339 @@ def _normalize_domain_list(domains: Any | Iterable | None) -> List[str]:
     if isinstance(domains, Iterable):
         return [str(item) for item in domains if item is not None]
     return [str(domains)]
+
+
+def _extend_unique(target: List[str], notes: Iterable[str]) -> None:
+    for note in notes:
+        if note and note not in target:
+            target.append(note)
+
+
+def _merge_notes(primary: Iterable[str], secondary: Iterable[str]) -> List[str]:
+    merged: List[str] = []
+    for bucket in (primary, secondary):
+        for note in bucket:
+            if note and note not in merged:
+                merged.append(note)
+    return merged
+
+
+def _build_plan_bundle(
+    *,
+    label: str,
+    summary: str,
+    stays: List[Stay],
+    travel: List[TravelLeg],
+    other_cost: float,
+    req: TripRequest,
+    trip_days: int,
+    combined_notes: List[str],
+    base_notes: List[str] | None,
+    local_transport: List[str],
+    experience_plan: List[DayPlan],
+    transfer_buffers: Dict[str, float],
+    transfer_override: int | None = None,
+) -> PlanBundle:
+    working_notes: List[str] = list(base_notes or [])
+    stay_total = sum(stay.nights * stay.budget_per_night for stay in stays)
+    travel_total = sum((leg.cost_estimate or 0.0) for leg in travel)
+    base_total = stay_total + travel_total + other_cost
+    logger.info(
+        "Preparing %s bundle with base cost %.2f %s (budget %.2f)",
+        label,
+        base_total,
+        req.currency,
+        req.budget_total,
+    )
+
+    budget_room = req.budget_total - base_total
+    travel_adjustments, travel_constraint = _optimize_travel_time(
+        travel, label, budget_room, req.currency
+    )
+    if travel_adjustments:
+        _extend_unique(working_notes, travel_adjustments)
+        travel_total = sum((leg.cost_estimate or 0.0) for leg in travel)
+        base_total = stay_total + travel_total + other_cost
+        budget_room = req.budget_total - base_total
+    if travel_constraint:
+        _extend_unique(working_notes, [travel_constraint])
+
+    adjusted_stays, adjusted_travel, total_cost, alignment_note, limitation_note = _align_bundle_components(
+        stays,
+        travel,
+        other_cost,
+        req,
+        label,
+    )
+
+    if alignment_note:
+        _extend_unique(working_notes, [alignment_note])
+
+    notes = _merge_notes(working_notes, combined_notes)
+    feasibility = _merge_notes(
+        combined_notes,
+        ([limitation_note] if limitation_note else []),
+    )
+
+    transfers = transfer_override if transfer_override is not None else len(adjusted_travel)
+    if transfers == 0 and adjusted_travel:
+        transfers = len(adjusted_travel)
+
+    bundle = PlanBundle(
+        label=label,
+        summary=summary,
+        total_cost=total_cost,
+        currency=req.currency,
+        transfers=transfers,
+        est_duration_days=trip_days,
+        travel=adjusted_travel,
+        stays=adjusted_stays,
+        local_transport=list(local_transport),
+        experience_plan=experience_plan,
+        notes=notes,
+        feasibility_notes=feasibility,
+        transfer_buffers=transfer_buffers,
+    )
+    final_gap = (
+        (bundle.total_cost - req.budget_total) / req.budget_total * 100.0
+        if req.budget_total
+        else 0.0
+    )
+    logger.info(
+        "Finalised %s bundle at %.2f %s (%+.2f%% vs budget)",
+        label,
+        bundle.total_cost,
+        req.currency,
+        final_gap,
+    )
+    return bundle
+
+
+def _align_bundle_components(
+    stays: List[Stay],
+    travel: List[TravelLeg],
+    other_cost: float,
+    req: TripRequest,
+    label: str,
+) -> Tuple[List[Stay], List[TravelLeg], float, str | None, str | None]:
+    budget_total = req.budget_total
+    currency = req.currency
+    if budget_total <= 0:
+        note = "Budget missing; left heuristic pricing in place."
+        logger.info("Budget not provided; skipping alignment for %s bundle", label)
+        total = sum(stay.nights * stay.budget_per_night for stay in stays) + sum(
+            (leg.cost_estimate or 0.0) for leg in travel
+        ) + other_cost
+        return stays, travel, total, note, None
+
+    raw_total = sum(stay.nights * stay.budget_per_night for stay in stays) + sum(
+        (leg.cost_estimate or 0.0) for leg in travel
+    ) + other_cost
+    if raw_total <= 0:
+        return stays, travel, 0.0, None, None
+
+    raw_scale = budget_total / raw_total
+    tolerance = 0.08 if label == "cheapest" else 0.05
+    if abs(1.0 - raw_scale) <= tolerance:
+        note = (
+            f"Costs sit within {abs(1.0 - raw_scale) * 100:.1f}% of the {budget_total:,.0f} {currency} budget."
+        )
+        logger.info("%s bundle already within tolerance of budget", label)
+        return stays, travel, raw_total, note, None
+
+    if label == "cheapest":
+        target_scale = min(max(raw_scale, 0.65), 1.05)
+    elif label == "comfort":
+        target_scale = min(max(raw_scale, 0.85), 1.2)
+    else:
+        target_scale = min(max(raw_scale, 0.8), 1.1)
+
+    adjusted_stays, adjusted_travel, adjusted_other_cost = _apply_budget_scale(
+        stays, travel, other_cost, target_scale, label
+    )
+    adjusted_total = sum(
+        stay.nights * stay.budget_per_night for stay in adjusted_stays
+    ) + sum((leg.cost_estimate or 0.0) for leg in adjusted_travel) + adjusted_other_cost
+
+    gap_after = budget_total - adjusted_total
+    gap_ratio_after = gap_after / budget_total
+    alignment_note = (
+        f"Aligned spend to {adjusted_total:,.0f} {currency} ({gap_ratio_after:+.1%} vs budget)."
+    )
+
+    limitation_note: str | None = None
+    if abs(gap_ratio_after) > 0.12:
+        if gap_after < 0:
+            limitation_note = (
+                "Even after cost trims the plan remains above budget; consider removing a stop or shifting travel to shoulder-season dates."
+            )
+        else:
+            limitation_note = (
+                "Plan sits well under budget; add experiences or extend nights to make the most of the allocation."
+            )
+    elif (target_scale in (0.65, 1.05, 0.85, 1.2, 0.8, 1.1)) and gap_after < 0:
+        limitation_note = (
+            "Supplier pricing caps prevented full alignment; nudging departure by a few days may unlock better rates."
+        )
+
+    logger.info(
+        "Budget alignment for %s bundle — raw_scale %.2f → applied %.2f, final gap %.2f%%",
+        label,
+        raw_scale,
+        target_scale,
+        gap_ratio_after * 100.0,
+    )
+    return adjusted_stays, adjusted_travel, adjusted_total, alignment_note, limitation_note
+
+
+def _apply_budget_scale(
+    stays: List[Stay],
+    travel: List[TravelLeg],
+    other_cost: float,
+    scale: float,
+    label: str,
+) -> Tuple[List[Stay], List[TravelLeg], float]:
+    if scale <= 0:
+        scale = 1.0
+
+    if scale >= 1.0:
+        stay_factor = scale * (1.05 if label == "comfort" else 1.02 if label == "balanced" else 1.0)
+        travel_factor = scale * (1.08 if label == "comfort" else 1.02)
+        other_factor = 1.0 + (scale - 1.0) * 0.6
+    else:
+        stay_factor = max(0.55, scale * (0.95 if label == "cheapest" else 0.9))
+        travel_factor = max(0.5, scale * (0.9 if label == "cheapest" else 0.85))
+        other_factor = 0.85 + 0.15 * scale
+
+    adjusted_stays = [
+        stay.model_copy(update={"budget_per_night": max(18.0, stay.budget_per_night * stay_factor)})
+        for stay in stays
+    ]
+    adjusted_travel: List[TravelLeg] = []
+    for leg in travel:
+        cost = leg.cost_estimate
+        if cost is not None:
+            cost = max(0.0, cost * travel_factor)
+        adjusted_travel.append(leg.model_copy(update={"cost_estimate": cost}))
+
+    adjusted_other_cost = max(0.0, other_cost * other_factor)
+    return adjusted_stays, adjusted_travel, adjusted_other_cost
+
+
+def _suggest_date_shifts(req: TripRequest, trip_days: int, baseline_total: float) -> List[str]:
+    suggestions: List[str] = []
+    try:
+        start_dt = datetime.strptime(req.dates.start, "%Y-%m-%d")
+        end_dt = datetime.strptime(req.dates.end, "%Y-%m-%d")
+    except Exception:
+        logger.debug("Unable to parse trip dates for suggestions", exc_info=True)
+        return suggestions
+
+    total_span = (end_dt - start_dt).days + 1
+
+    if start_dt.weekday() >= 4:
+        suggestions.append(
+            "Shifting departure to a Tue/Wed start often lowers fares and crowds compared to a weekend getaway."
+        )
+    if baseline_total > req.budget_total * 1.1 and req.budget_total > 0:
+        suggestions.append(
+            "Sliding the trip into the shoulder season (±7-10 days) can reduce stay rates by 15%+."
+        )
+    if trip_days < len(req.destinations) * 2:
+        suggestions.append(
+            "Add a flex day between cities so experiences feel less rushed and transfers stay manageable."
+        )
+    if start_dt.month in {6, 7, 8}:
+        suggestions.append(
+            "Summer peak pricing is high; a late-spring or early-fall window could unlock better value experiences."
+        )
+    if total_span >= 10:
+        suggestions.append(
+            "Include a lighter day mid-trip to balance energy levels on itineraries longer than a week."
+        )
+
+    logger.info("Date suggestions generated: %s", suggestions)
+    return suggestions
+
+
+def _optimize_travel_time(
+    travel: List[TravelLeg],
+    label: str,
+    budget_room: float,
+    currency: str,
+) -> Tuple[List[str], str | None]:
+    if not travel:
+        return [], None
+
+    durations = [
+        leg.duration_hr if leg.duration_hr is not None else _DEFAULT_MODE_DURATION.get(leg.mode, 3.0)
+        for leg in travel
+    ]
+    idx = max(range(len(travel)), key=lambda i: durations[i])
+    longest = travel[idx]
+    baseline_duration = durations[idx]
+
+    notes: List[str] = []
+    if baseline_duration < 4.5:
+        return notes, None
+
+    constraint_note: str | None = None
+    if label in {"balanced", "comfort"} and budget_room >= -150.0:
+        previous_cost = longest.cost_estimate or 0.0
+        upgraded_cost = previous_cost * 1.35 if previous_cost else 160.0
+        upgraded_leg = longest.model_copy(
+            update={
+                "mode": "flight",
+                "duration_hr": max(1.0, baseline_duration * 0.45),
+                "cost_estimate": upgraded_cost,
+            }
+        )
+        travel[idx] = upgraded_leg
+        saved_hours = baseline_duration - upgraded_leg.duration_hr
+        delta_cost = upgraded_cost - previous_cost
+        notes.append(
+            f"Upgraded {longest.frm}→{longest.to} to a short flight, saving ~{saved_hours:.1f}h for about {delta_cost:,.0f} {currency}."
+        )
+        logger.info(
+            "Applied travel-time upgrade for %s bundle leg %s→%s (saved %.1fh, delta %.2f)",
+            label,
+            longest.frm,
+            longest.to,
+            saved_hours,
+            delta_cost,
+        )
+    elif label == "cheapest" and budget_room > 0 and baseline_duration > 6.0:
+        previous_cost = longest.cost_estimate or 60.0
+        premium_cost = previous_cost * 1.15
+        faster_duration = max(2.5, baseline_duration * 0.7)
+        travel[idx] = longest.model_copy(
+            update={
+                "duration_hr": faster_duration,
+                "cost_estimate": premium_cost,
+            }
+        )
+        notes.append(
+            f"Reserved a faster {longest.mode} on {longest.frm}→{longest.to}, trimming travel by ~{baseline_duration - faster_duration:.1f}h with a modest upgrade."
+        )
+        logger.info(
+            "Applied faster ground option on cheapest bundle leg %s→%s (saved %.1fh, delta %.2f)",
+            longest.frm,
+            longest.to,
+            baseline_duration - faster_duration,
+            premium_cost - previous_cost,
+        )
+    else:
+        constraint_note = (
+            f"Longest hop {longest.frm}→{longest.to} remains {baseline_duration:.1f}h; move travel by a day or opt for an overnight service to ease transit."
+        )
+        logger.info(
+            "Unable to shorten longest leg %s→%s for %s bundle due to budget limits",
+            longest.frm,
+            longest.to,
+            label,
+        )
+
+    return notes, constraint_note
 
 
 def _split_nights(total_nights: int, n_stops: int) -> List[int]:

@@ -1,20 +1,36 @@
 # app/llm.py
 import os
-from typing import List, Dict, Any
-from openai import OpenAI
-from dotenv import load_dotenv
 import json
+import logging
+from typing import List, Dict, Any
+from dotenv import load_dotenv
+
+try:
+    from openai import OpenAI
+except Exception:  # pragma: no cover - fallback when openai missing in tests
+    OpenAI = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
+logger.propagate = False
 
 # Load .env file if present
 load_dotenv()
 
 # Get API key from environment
 api_key = os.getenv("OPENAI_API_KEY")
-if not api_key:
-    raise RuntimeError("Missing OPENAI_API_KEY. Set it in your .env file or export it.")
-
-# Initialize OpenAI client
-_client = OpenAI(api_key=api_key)
+if api_key and OpenAI is not None:
+    _client = OpenAI(api_key=api_key)
+else:  # pragma: no cover - exercised indirectly in tests without API key
+    _client = None
+    if not api_key:
+        logger.warning("OPENAI_API_KEY not set; returning stubbed responses from call_llm")
+    else:
+        logger.warning("openai package unavailable; returning stubbed responses from call_llm")
 
 SYSTEM_PROMPT = """You are a travel-planning agent.
 Use ONLY the provided web snippets.
@@ -61,6 +77,19 @@ def call_llm(payload: Dict[str, Any], snippets: List[Dict[str, str]], model: str
         destinations=payload.get("destinations"),
         snippets=_build_snippets(snippets),
     )
+
+    if _client is None:
+        logger.info(
+            "Skipping LLM call — returning budget-friendly stub payload (missing client or API key)."
+        )
+        return {
+            "llm": "skipped",
+            "reason": "missing_openai_client",
+            "echo": {
+                "origin": payload.get("origin"),
+                "destinations": payload.get("destinations"),
+            },
+        }
 
     resp = _client.chat.completions.create(
         model=model,
