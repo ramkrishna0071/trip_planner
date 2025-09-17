@@ -4,46 +4,11 @@ import ChatPanel from './components/ChatPanel.jsx';
 import PlanSummary from './components/PlanSummary.jsx';
 import BundlesView from './components/BundlesView.jsx';
 import SourceList from './components/SourceList.jsx';
-import { sampleRequest, sampleResponse } from './lib/sampleData.js';
+import { sampleResponse } from './lib/sampleData.js';
+import { buildRequestPayload } from './lib/payload.js';
 import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
-
-function inferPurpose(objective) {
-  switch (objective) {
-    case 'family_friendly':
-      return 'family vacation';
-    case 'comfort':
-      return 'premium leisure escape';
-    case 'cheapest':
-      return 'budget getaway';
-    default:
-      return 'leisure';
-  }
-}
-
-function buildRequestPayload(formValues) {
-  return {
-    ...sampleRequest,
-    origin: formValues.origin || sampleRequest.origin,
-    destinations: formValues.destinations.length ? formValues.destinations : sampleRequest.destinations,
-    dates: {
-      start: formValues.startDate || sampleRequest.dates.start,
-      end: formValues.endDate || sampleRequest.dates.end,
-    },
-    budget_total: Number.isFinite(formValues.budget) && formValues.budget > 0 ? formValues.budget : sampleRequest.budget_total,
-    party: {
-      adults: formValues.adults ?? sampleRequest.party.adults,
-      children: formValues.children ?? sampleRequest.party.children,
-      seniors: formValues.seniors ?? sampleRequest.party.seniors,
-    },
-    purpose: formValues.purpose?.trim() || inferPurpose(formValues.objective),
-    prefs: {
-      ...sampleRequest.prefs,
-      objective: formValues.objective || sampleRequest.prefs.objective,
-    },
-  };
-}
 
 function formatDestinations(destinations) {
   return destinations.length ? destinations.join(', ') : 'your selected cities';
