@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Dict, Any
 
 import httpx
 import pytest
@@ -126,3 +126,43 @@ async def test_orchestrator_dedupes_and_fetches_unique_results(monkeypatch):
     assert len(snippets) == 3
     assert {s["url"] for s in snippets} == set(fetch_calls)
     assert collected_snippets["value"] == snippets
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_foundation_preserves_user_extras(monkeypatch):
+    from app import orchestrator
+
+    captured: Dict[str, Any] = {}
+
+    def fake_call_llm(payload, snippets):
+        captured["agent_context"] = payload.get("agent_context")
+        return {"llm": "ok"}
+
+    monkeypatch.setattr(orchestrator, "call_llm", fake_call_llm)
+    monkeypatch.setattr(orchestrator, "WebSearcher", None)
+
+    payload = {
+        "origin": "Lisbon",
+        "destinations": ["Porto"],
+        "dates": {"start": "2025-03-01", "end": "2025-03-05"},
+        "budget_total": 1800.0,
+        "currency": "EUR",
+        "party": {"adults": 2, "children": 1},
+        "interests": ["food tours", "history"],
+        "constraints": {"diet": ["vegetarian"], "max_flight_hours": 6},
+    }
+
+    data = await orchestrator.orchestrate_llm_trip(payload)
+
+    agent_context = data.get("agent_context")
+    assert agent_context is not None
+
+    foundation = agent_context.get("foundation")
+    assert foundation
+    assert foundation.get("interests") == payload["interests"]
+    assert foundation.get("constraints") == payload["constraints"]
+
+    captured_ctx = captured.get("agent_context")
+    assert captured_ctx is not None
+    assert captured_ctx.get("foundation", {}).get("interests") == payload["interests"]
+    assert captured_ctx.get("foundation", {}).get("constraints") == payload["constraints"]
