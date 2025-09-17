@@ -1,0 +1,45 @@
+.booking-links {
+  display: grid;
+  gap: 16px;
+}
+
+.booking-links__group {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 16px;
+}
+
+.booking-links__group h4 {
+  margin: 0 0 12px;
+  font-size: 0.95rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #1d4ed8;
+}
+
+.booking-links__group ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.booking-links__group li a {
+  color: #1f2937;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.booking-links__group li a:hover {
+  text-decoration: underline;
+}
+
+.booking-links__details {
+  display: block;
+  color: #475467;
+  font-size: 0.85rem;
+  margin-top: 4px;
+}

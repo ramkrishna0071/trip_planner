@@ -41,3 +41,13 @@ def test_max_flight_hours_penalises_comfort_plan():
     assert response.options[0].label != "comfort"
     comfort = next(opt for opt in response.options if opt.label == "comfort")
     assert comfort.scores["time"] < 0.8
+
+
+def test_plan_bundles_surface_booking_links():
+    response = plan_trip(_build_request("balanced"))
+    top_option = response.options[0]
+    assert top_option.booking_links, "expected booking links for the top bundle"
+    categories = {link.category for link in top_option.booking_links}
+    assert "stay" in categories
+    assert "local_pass" in categories
+    assert any(cat in categories for cat in {"train", "bus", "flight", "transport"})
