@@ -19,7 +19,7 @@ function ChatPanel({ messages }) {
       <header className="chat-panel__header">
         <div>
           <h1>Trip planning workspace</h1>
-          <p>Inspired by conversational planners like Mindtrip and Airial.</p>
+          <p>Inspired by travel lovers and genai.</p>
         </div>
         <span className="chat-panel__badge">Preview</span>
       </header>
