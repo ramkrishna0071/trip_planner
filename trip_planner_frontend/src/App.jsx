@@ -9,6 +9,19 @@ import './App.css';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
 
+function inferPurpose(objective) {
+  switch (objective) {
+    case 'family_friendly':
+      return 'family vacation';
+    case 'comfort':
+      return 'premium leisure escape';
+    case 'cheapest':
+      return 'budget getaway';
+    default:
+      return 'leisure';
+  }
+}
+
 function buildRequestPayload(formValues) {
   return {
     ...sampleRequest,
@@ -24,6 +37,7 @@ function buildRequestPayload(formValues) {
       children: formValues.children ?? sampleRequest.party.children,
       seniors: formValues.seniors ?? sampleRequest.party.seniors,
     },
+    purpose: formValues.purpose?.trim() || inferPurpose(formValues.objective),
     prefs: {
       ...sampleRequest.prefs,
       objective: formValues.objective || sampleRequest.prefs.objective,
@@ -57,7 +71,10 @@ function App() {
   const planNotes = planResult?.agent_context?.notes ?? [];
 
   const addMessage = (message) => {
-    setMessages((prev) => [...prev, { ...message, id: `${message.role}-${Date.now()}-${Math.random().toString(16).slice(2)}` }]);
+    setMessages((prev) => [
+      ...prev,
+      { ...message, id: `${message.role}-${Date.now()}-${Math.random().toString(16).slice(2)}` },
+    ]);
   };
 
   const handlePlanSubmit = async (formValues) => {
@@ -65,7 +82,9 @@ function App() {
 
     addMessage({
       role: 'user',
-      content: `I want to travel from ${requestPayload.origin} to ${formatDestinations(requestPayload.destinations)} between ${requestPayload.dates.start} and ${requestPayload.dates.end} with a budget of $${requestPayload.budget_total}.` ,
+      content: `I want to travel from ${requestPayload.origin} to ${formatDestinations(
+        requestPayload.destinations
+      )} between ${requestPayload.dates.start} and ${requestPayload.dates.end} with a budget of $${requestPayload.budget_total}.`,
     });
 
     setLoading(true);

@@ -11,6 +11,8 @@ API (via FastAPI) or exercised locally to inspect orchestration logs.
   management.
 - An OpenAI API key stored in `OPENAI_API_KEY` if you want to call the hosted
   model. Without it, the system falls back to deterministic stub responses.
+- A Tavily API key (`TAVILY_API_KEY`) for live web search. When absent the
+  orchestrator retains heuristic city highlights and logs the fallback path.
 - Optional: credentials for your preferred web-search adapter. The default
   implementation does not require authentication, but you can plug in your own
   tool by editing `app/tools/websearch.py`.
@@ -37,8 +39,8 @@ Launch the API server with uvicorn:
 uv run uvicorn app.main:app --reload
 ```
 
-The primary endpoint is `POST /api/plan`, which accepts the `TripRequest` schema
-from `app/schemas.py`. Example payload:
+The primary endpoint is `POST /api/plan`, which accepts the `TripRequest` schema from `app/schemas.py`. Example payload:
+
 
 ```json
 {
@@ -54,6 +56,19 @@ from `app/schemas.py`. Example payload:
 
 The response now includes `source_links`, `snippets`, and `agent_context`
 entries so you can attribute recommendations and inspect intermediate state.
+Each bundle’s cost ledger tracks stays, intercity transport, food, activities,
+and remaining misc headroom so you can compare the spend against the requested
+budget at a glance.
+
+> **Tip:** The React frontend under `trip_planner_frontend/` targets
+> `http://localhost:8000/api/plan` by default. Set
+> `VITE_API_BASE_URL=http://localhost:8000` in
+> `trip_planner_frontend/.env.local` while the FastAPI server is running to
+> see live orchestration output instead of the bundled sample itinerary.
+
+If you need to restrict browser origins, configure
+`TRIP_PLANNER_ALLOWED_ORIGINS` (comma-separated list). The default `*` keeps
+local development simple by allowing the Vite dev server to call the API.
 
 ## Inspecting orchestration logs
 

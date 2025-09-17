@@ -34,6 +34,22 @@ _level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
 logger.setLevel(getattr(logging, _level, logging.INFO))
 logger.propagate = False
 
+# Search providers vary widely in the keys they expose for summarised content.
+# Normalise here so downstream logic can treat them uniformly.
+def _payload_snippet(payload: Dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in ("content", "snippet", "text", "description", "answer", "raw_content"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    highlights = payload.get("highlights")
+    if isinstance(highlights, list):
+        joined = " ".join([item.strip() for item in highlights if isinstance(item, str) and item.strip()])
+        if joined:
+            return joined
+    return ""
+
 # If your websearch tool isn't ready, these imports will be skipped gracefully.
 try:
     from app.tools.websearch import WebSearcher, SourcePolicy
@@ -153,12 +169,14 @@ def plan_trip(
     base_cost_stay = sum(s.nights * s.budget_per_night for s in stays)
     base_cost_move = sum(l.cost_estimate or 0 for l in intercity)
     food_misc = trip_days * party_size * ppd_val * 0.35
-    baseline_total = base_cost_stay + base_cost_move + food_misc
+    activity_cost = trip_days * party_size * ppd_val * 0.15
+    baseline_total = base_cost_stay + base_cost_move + food_misc + activity_cost
     logger.info(
-        "Baseline composition — stays %.2f, transport %.2f, food %.2f (total %.2f %s) against budget %.2f",
+        "Baseline composition — stays %.2f, transport %.2f, food %.2f, activities %.2f (total %.2f %s) against budget %.2f",
         base_cost_stay,
         base_cost_move,
         food_misc,
+        activity_cost,
         baseline_total,
         req.currency,
         req.budget_total,
@@ -170,6 +188,7 @@ def plan_trip(
         "stays": round(base_cost_stay, 2),
         "transport": round(base_cost_move, 2),
         "food": round(food_misc, 2),
+        "activities": round(activity_cost, 2),
         "other": 0.0,
         "total": round(baseline_total, 2),
         "budget": req.budget_total,
@@ -194,6 +213,10 @@ def plan_trip(
         for s in stays
     ]
 
+    balanced_other_cost = food_misc + activity_cost
+    cheapest_other_cost = food_misc * 0.85 + activity_cost * 0.6
+    comfort_other_cost = food_misc * 1.15 + activity_cost * 1.2
+
     # Construct a mix of bundles that share the baseline experiences but vary
     # in the level of spend and pace.
     options: List[PlanBundle] = [
@@ -202,7 +225,7 @@ def plan_trip(
             summary="Balanced cost, pace and comfort.",
             stays=[stay.model_copy(deep=True) for stay in stays],
             travel=[leg.model_copy(deep=True) for leg in intercity],
-            other_cost=food_misc,
+            other_cost=balanced_other_cost,
             req=req,
             trip_days=trip_days,
             combined_notes=combined_notes,
@@ -218,7 +241,7 @@ def plan_trip(
             summary="Minimize cost using homestays and public transport.",
             stays=[stay.model_copy(deep=True) for stay in cheapest_stays],
             travel=[leg.model_copy(deep=True) for leg in intercity],
-            other_cost=food_misc * 0.9,
+            other_cost=cheapest_other_cost,
             req=req,
             trip_days=trip_days,
             combined_notes=combined_notes,
@@ -252,7 +275,7 @@ def plan_trip(
                 )
                 for leg in intercity
             ],
-            other_cost=food_misc * 1.1,
+            other_cost=comfort_other_cost,
             req=req,
             trip_days=trip_days,
             combined_notes=combined_notes,
@@ -287,6 +310,7 @@ def plan_trip(
         scored_options.append(bundle)
 
     options = sorted(scored_options, key=lambda b: b.scores.get("composite", 0.0), reverse=True)
+    options = _promote_preferred_option(options, req.prefs.objective)
 
     agent_context_model = AgentContext.model_validate(ctx) if ctx else None
     logger.info(
@@ -411,7 +435,7 @@ async def orchestrate_llm_trip(
                     }
                 )
                 continue
-            snippet_text = payload.get("content") or ""
+            snippet_text = _payload_snippet(payload)
             if snippet_text:
                 snippets.append(
                     {
@@ -439,10 +463,11 @@ async def orchestrate_llm_trip(
         logger.info("WebSearcher unavailable; continuing with heuristic planning only")
 
     # Derive richer context from specialised agents.
-    destination_context = expand_destinations(foundation, snippets)
+destination_context = expand_destinations(foundation, snippets)
 
-    llm_sources: List[Dict[str, Any]] = []
-    heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
+llm_sources: List[Dict[str, Any]] = []
+heuristic_cities: List[str] = destination_context.get("heuristic_cities", []) or []
+remaining_heuristics = set(heuristic_cities)
     if heuristic_cities:
         missing_details: List[str] = []
         for city in heuristic_cities:
@@ -468,6 +493,7 @@ async def orchestrate_llm_trip(
             or os.getenv("TRIP_PLANNER_FALLBACK_MODEL")
             or "gpt-4o-mini"
         )
+        
         backfill_data = llm_backfill_city_details(heuristic_cities, foundation, model=backfill_model)
         if backfill_data:
             dest_notes = destination_context.setdefault("notes", []) or []
@@ -486,6 +512,13 @@ async def orchestrate_llm_trip(
                         filled_fields.append(key)
                 if filled_fields:
                     dest_entry["source"] = "llm"
+                    remaining_heuristics.discard(city)
+                    logger.info(
+                        "LLM backfill (%s) provided %s for %s",
+                        backfill_model,
+                        ", ".join(filled_fields),
+                        city,
+                    )
                 if data.get("notes"):
                     _extend_unique(dest_notes, data["notes"])
                     if not filled_fields:
@@ -519,7 +552,20 @@ async def orchestrate_llm_trip(
                 ],
             )
 
-    logistics_context = compute_logistics(foundation)
+    destination_context["heuristic_cities"] = sorted(remaining_heuristics)
+    if remaining_heuristics:
+        heuristic_sources = destination_context.setdefault("sources", [])
+        for city in sorted(remaining_heuristics):
+            heuristic_sources.append(
+                {
+                    "city": city,
+                    "title": f"{city} heuristic scaffold",
+                    "url": "heuristic://template",
+                    "fields": "highlights, experiences",
+                }
+            )
+
+
 
     aggregated_notes = list({note: None for note in (
         *(foundation.get("notes", []) or []),
@@ -529,8 +575,10 @@ async def orchestrate_llm_trip(
 
     # Promote the snippet URLs so downstream consumers can surface citations.
     source_links = sorted({snip["url"] for snip in snippets if snip.get("url")})
-    if llm_sources:
-        source_links = sorted({*source_links, *(f"llm://{entry['model']}" for entry in llm_sources)})
+
+    extra_source_urls = [src.get("url") for src in destination_context.get("sources", []) if src.get("url")]
+    if extra_source_urls:
+        source_links = sorted({*source_links, *extra_source_urls})
 
     agent_context: Dict[str, Any] = {
         "foundation": foundation,
@@ -1326,7 +1374,12 @@ def _apply_preferences(
         time_score = _clamp(time_score + flex_score * 0.1)
     elif prefs.objective == "balanced":
         cost_score = _clamp(0.5 * cost_score + 0.5 * center_score)
-        time_score = max(time_score, 0.4)
+        if metrics.get("flight_hours", 0.0) > 0:
+            time_score = max(time_score, 0.4)
+            penalty = min(0.3, 0.1 * metrics.get("flight_hours", 0.0))
+            time_score = _clamp(time_score * (1.0 - penalty))
+        else:
+            time_score = max(time_score, 0.65)
 
     if prefs.flexible_days:
         weights["time"] *= 1.0 / (1.0 + 0.05 * prefs.flexible_days)
@@ -1366,6 +1419,25 @@ def _apply_preferences(
         "experience": experience_score,
         "composite": composite,
     }
+
+
+def _promote_preferred_option(options: List[PlanBundle], preferred_label: str | None) -> List[PlanBundle]:
+    if not options or not preferred_label:
+        return options
+    try:
+        target_idx = next((idx for idx, opt in enumerate(options) if opt.label == preferred_label), None)
+    except Exception:
+        return options
+    if target_idx is None or target_idx == 0:
+        return options
+    best_score = options[0].scores.get("composite", 0.0)
+    preferred_score = options[target_idx].scores.get("composite", 0.0)
+    threshold = 0.04
+    if preferred_score >= best_score or best_score - preferred_score <= threshold:
+        preferred = options[target_idx]
+        reordered = [preferred] + options[:target_idx] + options[target_idx + 1 :]
+        return reordered
+    return options
 
 
 def _attach_score_notes(bundle: PlanBundle) -> None:
