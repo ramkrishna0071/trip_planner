@@ -3,6 +3,17 @@ from __future__ import annotations
 
 import re
 from typing import Any, Dict, Iterable, List, Tuple
+import logging
+import os
+
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+    logger.addHandler(handler)
+_level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
+logger.setLevel(getattr(logging, _level, logging.INFO))
+logger.propagate = False
 
 
 def expand_destinations(foundation: Dict[str, Any], snippets: Iterable[Dict[str, str]] | None = None) -> Dict[str, Any]:
@@ -34,7 +45,9 @@ def expand_destinations(foundation: Dict[str, Any], snippets: Iterable[Dict[str,
             snippet_sources.append({"city": city, "title": title, "url": url})
 
     fallback_notes: List[str] = []
+    heuristic_cities: List[str] = []
     if not snippets:
+        logger.warning("No web snippets available; using heuristic destination highlights")
         fallback_notes.append("Web search unavailable; used heuristics for experiences.")
 
     season = foundation.get("dates", {}).get("season")
@@ -51,6 +64,8 @@ def expand_destinations(foundation: Dict[str, Any], snippets: Iterable[Dict[str,
 
         if not highlights:
             highlights = _fallback_highlights(city, interests)
+            heuristic_cities.append(city)
+            logger.warning("Missing snippet coverage for %s; applying heuristic highlights", city)
         experiences = _build_experiences(city, highlights, interests)
         if dining:
             experiences.append(f"Sample local flavours: {', '.join(dining[:2])}.")
@@ -60,6 +75,7 @@ def expand_destinations(foundation: Dict[str, Any], snippets: Iterable[Dict[str,
             "highlights": highlights[:5],
             "experiences": experiences[:5],
             "dining": dining[:3],
+            "source": "web" if city not in heuristic_cities else "heuristic",
         })
 
     notes = fallback_notes
@@ -67,6 +83,7 @@ def expand_destinations(foundation: Dict[str, Any], snippets: Iterable[Dict[str,
         "destinations": expanded,
         "sources": snippet_sources,
         "notes": notes,
+        "heuristic_cities": heuristic_cities,
     }
 
 
