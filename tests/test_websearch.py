@@ -164,6 +164,66 @@ def test_orchestrator_dedupes_and_fetches_unique_results(monkeypatch):
     asyncio.run(run())
 
 
+def test_orchestrator_uses_search_summaries_when_fetch_fails(monkeypatch):
+    async def run() -> None:
+        monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+        from app import orchestrator
+
+        def fake_call_llm(payload, snippets):
+            # Return predictable payload while capturing snippets for inspection.
+            run.captured = list(snippets)
+            return {"llm": "ok"}
+
+        monkeypatch.setattr(orchestrator, "call_llm", fake_call_llm)
+
+        class FakeSearcher:
+            def __init__(self, policy):
+                self.policy = policy
+                self.fetch_calls: List[str] = []
+
+            async def search(self, query: str):
+                return [
+                    {
+                        "url": "https://allowed.com/summary", 
+                        "title": "Allowed summary",
+                        "content": "Paris family passes include museum bundles and metro savings.",
+                    },
+                    {
+                        "url": "https://allowed.com/snippet",
+                        "title": "Allowed snippet",
+                        "snippet": "Amsterdam kid-friendly bike tours and canal cruises.",
+                    },
+                ]
+
+            async def fetch(self, url: str):
+                self.fetch_calls.append(url)
+                return None
+
+        monkeypatch.setattr(orchestrator, "WebSearcher", FakeSearcher)
+
+        payload = {
+            "origin": "Paris",
+            "destinations": ["Amsterdam"],
+            "dates": {"start": "2025-04-10", "end": "2025-04-15"},
+            "budget_total": 2800.0,
+            "currency": "EUR",
+            "party": {"adults": 2},
+            "prefs": {"objective": "balanced"},
+        }
+
+        data = await orchestrator.orchestrate_llm_trip(payload)
+
+        snippets = data.get("snippets")
+        assert snippets and len(snippets) == 2
+        assert all(snippet["source"] == "search_summary" for snippet in snippets)
+        assert all(snippet["text"] for snippet in snippets)
+        # Snippets returned to the LLM should match the recorded list.
+        assert run.captured == snippets
+
+    run.captured = []  # type: ignore[attr-defined]
+    asyncio.run(run())
+
+
 def test_orchestrator_respects_payload_domain_lists(monkeypatch):
     async def run() -> None:
         monkeypatch.setenv("OPENAI_API_KEY", "test-key")

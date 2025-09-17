@@ -11,6 +11,8 @@ API (via FastAPI) or exercised locally to inspect orchestration logs.
   management.
 - An OpenAI API key stored in `OPENAI_API_KEY` if you want to call the hosted
   model. Without it, the system falls back to deterministic stub responses.
+- A Tavily API key (`TAVILY_API_KEY`) for live web search. When absent the
+  orchestrator retains heuristic city highlights and logs the fallback path.
 - Optional: credentials for your preferred web-search adapter. The default
   implementation does not require authentication, but you can plug in your own
   tool by editing `app/tools/websearch.py`.
@@ -54,6 +56,9 @@ schema from `app/schemas.py`. Example payload:
 
 The response now includes `source_links`, `snippets`, and `agent_context`
 entries so you can attribute recommendations and inspect intermediate state.
+Each bundle’s cost ledger tracks stays, intercity transport, food, activities,
+and remaining misc headroom so you can compare the spend against the requested
+budget at a glance.
 
 > **Tip:** The React frontend under `trip_planner_frontend/` targets
 > `http://localhost:8000/api/plan` by default. Set

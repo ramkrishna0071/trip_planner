@@ -19,6 +19,19 @@ _level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
 logger.setLevel(getattr(logging, _level, logging.INFO))
 logger.propagate = False
 
+DEFAULT_HEADERS: Dict[str, str] = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/123.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Referer": "https://www.google.com/",
+}
+
 @dataclass
 class SourcePolicy:
     allow_domains: Optional[Sequence[str]] = None
@@ -70,6 +83,7 @@ class WebSearcher:
             "max_results": self.policy.max_results * 2,
             "include_answer": False,
             "include_images": False,
+            "include_raw_content": True,
         }
         if self.policy.allow_domains:
             payload["include_domains"] = list(self.policy.allow_domains)
@@ -89,7 +103,7 @@ class WebSearcher:
             return None
         try:
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                r = await client.get(url, headers={"User-Agent":"trip-planner/1.0"})
+                r = await client.get(url, headers=DEFAULT_HEADERS)
                 r.raise_for_status()
                 text = html_to_text(r.text)[:12000]
                 title = self._title_from_html(r.text) or url
