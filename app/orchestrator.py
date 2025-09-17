@@ -209,6 +209,27 @@ async def orchestrate_llm_trip(payload: Dict[str, Any],
     trip_req = TripRequest.model_validate(payload)
     foundation = extract_foundation(trip_req)
 
+    if "interests" in payload:
+        raw_interests = payload.get("interests")
+        if isinstance(raw_interests, str):
+            foundation["interests"] = [raw_interests]
+        elif isinstance(raw_interests, Iterable):
+            foundation["interests"] = [str(item) for item in raw_interests if item is not None]
+        else:
+            foundation["interests"] = [str(raw_interests)] if raw_interests is not None else []
+
+    if "constraints" in payload:
+        raw_constraints = payload.get("constraints")
+        if isinstance(raw_constraints, dict):
+            foundation["constraints"] = raw_constraints
+        elif raw_constraints is None:
+            foundation["constraints"] = {}
+        else:
+            try:
+                foundation["constraints"] = dict(raw_constraints)
+            except Exception:
+                foundation["constraints"] = {"value": raw_constraints}
+
     resolved_allow = _normalize_domain_list(
         allow_domains if allow_domains is not None else payload.get("allow_domains")
     )
