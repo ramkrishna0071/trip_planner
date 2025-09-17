@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 from typing import List, Dict, Any, Tuple
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timedelta
+from urllib.parse import urlencode, quote_plus
 import asyncio
 import logging
 
@@ -17,6 +18,7 @@ from app.schemas import (
     DayPlan,
     AgentContext,
     TripPrefs,
+    BookingLink,
 )
 from app.llm import call_llm, llm_backfill_city_details  # import at module top to avoid circulars
 from app.agents.foundation_agent import extract_foundation
@@ -95,7 +97,11 @@ def plan_trip(
         nights_allocation = _split_nights(nights, n_stops)
 
     party_size = req.party.adults + req.party.children + req.party.seniors
-    ppd_val = float(foundation_ctx.get("budget", {}).get("per_person_per_day") or _ppd(req.budget_total, trip_days, party_size))
+    ppd_val = float(
+        foundation_ctx.get("budget", {}).get("per_person_per_day")
+        or _ppd(req.budget_total, trip_days, party_size)
+    )
+    stay_windows = _infer_stay_windows(req, nights_allocation, logistics_ctx, foundation_ctx)
 
     logger.info(
         "Planning trip for %s travellers from %s visiting %s between %s and %s with budget %.2f %s",
@@ -205,6 +211,7 @@ def plan_trip(
             experience_plan=[day.model_copy(deep=True) for day in base_experiences],
             transfer_buffers=transfer_buffers,
             transfer_override=len(intercity),
+            stay_windows=stay_windows,
         ),
         _build_plan_bundle(
             label="cheapest",
@@ -223,6 +230,7 @@ def plan_trip(
             experience_plan=[day.model_copy(deep=True) for day in base_experiences],
             transfer_buffers=transfer_buffers,
             transfer_override=max(1, len(intercity)),
+            stay_windows=stay_windows,
         ),
         _build_plan_bundle(
             label="comfort",
@@ -253,6 +261,7 @@ def plan_trip(
             experience_plan=[day.model_copy(deep=True) for day in base_experiences],
             transfer_buffers=transfer_buffers,
             transfer_override=len(intercity),
+            stay_windows=stay_windows,
         ),
     ]
 
@@ -622,6 +631,7 @@ def _build_plan_bundle(
     experience_plan: List[DayPlan],
     transfer_buffers: Dict[str, float],
     transfer_override: int | None = None,
+    stay_windows: List[Dict[str, str]] | None = None,
 ) -> PlanBundle:
     working_notes: List[str] = list(base_notes or [])
     stay_total = sum(stay.nights * stay.budget_per_night for stay in stays)
@@ -668,6 +678,14 @@ def _build_plan_bundle(
     if transfers == 0 and adjusted_travel:
         transfers = len(adjusted_travel)
 
+    booking_links = _compose_booking_links(
+        adjusted_stays,
+        adjusted_travel,
+        stay_windows or [],
+        experience_plan,
+        req,
+    )
+
     bundle = PlanBundle(
         label=label,
         summary=summary,
@@ -682,6 +700,7 @@ def _build_plan_bundle(
         notes=notes,
         feasibility_notes=feasibility,
         transfer_buffers=transfer_buffers,
+        booking_links=booking_links,
     )
     final_gap = (
         (bundle.total_cost - req.budget_total) / req.budget_total * 100.0
@@ -698,6 +717,203 @@ def _build_plan_bundle(
     return bundle
 
 
+def _compose_booking_links(
+    stays: List[Stay],
+    travel: List[TravelLeg],
+    stay_windows: List[Dict[str, str]],
+    experience_plan: List[DayPlan],
+    req: TripRequest,
+) -> List[BookingLink]:
+    links: List[BookingLink] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def _append(category: str, label: str, url: str, details: str | None = None) -> None:
+        if not url:
+            return
+        key = (category, label, url)
+        if key in seen:
+            return
+        seen.add(key)
+        links.append(BookingLink(category=category, label=label, url=url, details=details))
+
+    window_by_city = {}
+    for idx, stay in enumerate(stays):
+        window = stay_windows[idx] if idx < len(stay_windows) else {}
+        window_by_city.setdefault(stay.city, window)
+        check_in = window.get("check_in")
+        check_out = window.get("check_out")
+        url = _build_hotel_url(stay.city, check_in, check_out, req)
+        details = _format_date_range(check_in, check_out, suffix=f" • {stay.nights} night(s)")
+        _append("stay", f"Stay in {stay.city}", url, details)
+
+    for leg in travel:
+        depart_date = _coerce_date(leg.date) or window_by_city.get(leg.frm, {}).get("check_out")
+        url = _build_transport_url(leg, depart_date)
+        category = leg.mode if leg.mode in {"flight", "train", "bus"} else "transport"
+        details = f"Depart {depart_date}" if depart_date else None
+        _append(category, f"{leg.mode.title()} {leg.frm} → {leg.to}", url, details)
+
+    for stay in stays:
+        window = window_by_city.get(stay.city, {})
+        arrival = window.get("check_in")
+        departure = window.get("check_out")
+        url = _build_city_pass_url(stay.city, arrival, departure)
+        details = _format_date_range(arrival, departure)
+        _append("local_pass", f"{stay.city} city & transit passes", url, details)
+
+    experience_queries: Dict[str, List[str]] = {}
+    for day in experience_plan:
+        if not day.city:
+            continue
+        queries = experience_queries.setdefault(day.city, [])
+        for item in day.must_do[:1]:
+            cleaned = item.strip()
+            if cleaned and cleaned not in queries:
+                queries.append(cleaned)
+    for city, items in experience_queries.items():
+        window = window_by_city.get(city, {})
+        arrival = window.get("check_in")
+        departure = window.get("check_out")
+        for item in items[:2]:
+            url = _build_sight_url(city, item, arrival, departure)
+            details = _format_date_range(arrival, departure)
+            _append("sightseeing", item, url, details)
+
+    return links
+
+
+def _build_hotel_url(city: str, check_in: str | None, check_out: str | None, req: TripRequest) -> str:
+    base = "https://www.booking.com/searchresults.html"
+    adults = max(req.party.adults + req.party.seniors, 1)
+    children = max(req.party.children, 0)
+    params = {
+        "ss": city,
+        "group_adults": adults,
+        "group_children": children,
+        "no_rooms": 1,
+    }
+    if check_in:
+        params["checkin"] = check_in
+    if check_out:
+        params["checkout"] = check_out
+    return f"{base}?{urlencode(params)}"
+
+
+def _build_transport_url(leg: TravelLeg, depart_date: str | None) -> str:
+    if leg.mode == "flight":
+        query = f"flights from {leg.frm} to {leg.to}"
+        if depart_date:
+            query += f" on {depart_date}"
+        return f"https://www.google.com/travel/flights?q={quote_plus(query)}"
+
+    base = "https://www.omio.com/search"
+    params = {
+        "departure": leg.frm,
+        "arrival": leg.to,
+    }
+    if depart_date:
+        params["date"] = depart_date
+    if leg.mode in {"train", "bus"}:
+        params["mode"] = leg.mode
+    return f"{base}?{urlencode(params)}"
+
+
+def _build_city_pass_url(city: str, arrival: str | None, departure: str | None) -> str:
+    params = {"q": f"{city} city pass"}
+    if arrival:
+        params["date_from"] = arrival
+    if departure:
+        params["date_to"] = departure
+    return f"https://www.getyourguide.com/s/?{urlencode(params)}"
+
+
+def _build_sight_url(city: str, experience: str, arrival: str | None, departure: str | None) -> str:
+    query = f"{experience} {city} tickets"
+    params = {"q": query}
+    if arrival:
+        params["date_from"] = arrival
+    if departure:
+        params["date_to"] = departure
+    return f"https://www.getyourguide.com/s/?{urlencode(params)}"
+
+
+def _format_date_range(start: str | None, end: str | None, *, suffix: str | None = None) -> str | None:
+    if not start and not end:
+        return suffix.lstrip() if suffix else None
+    parts = []
+    if start:
+        parts.append(start)
+    if end:
+        parts.append(end)
+    details = " → ".join(parts)
+    if suffix:
+        details = f"{details}{suffix}"
+    return details
+
+
+def _infer_stay_windows(
+    req: TripRequest,
+    nights_allocation: List[int],
+    logistics_ctx: Dict[str, Any],
+    foundation_ctx: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    windows: List[Dict[str, str]] = []
+    timeline = []
+    if isinstance(logistics_ctx, dict):
+        timeline = logistics_ctx.get("timeline") or []
+    for entry in timeline:
+        city = entry.get("city")
+        if not city:
+            continue
+        check_in = _coerce_date(entry.get("arrival"))
+        check_out = _coerce_date(entry.get("departure"))
+        windows.append({"city": city, "check_in": check_in, "check_out": check_out})
+
+    if len(windows) == len(req.destinations):
+        return windows
+
+    fallback_start = foundation_ctx.get("dates", {}).get("start") or req.dates.start
+    start_dt = _parse_date(fallback_start)
+    cursor = start_dt
+    fallback: List[Dict[str, str]] = []
+    for city, nights in zip(req.destinations, nights_allocation):
+        nights = max(int(nights or 1), 1)
+        check_in = cursor.date().isoformat() if cursor else None
+        cursor = cursor + timedelta(days=nights) if cursor else None
+        check_out = cursor.date().isoformat() if cursor else None
+        fallback.append({"city": city, "check_in": check_in, "check_out": check_out})
+    if len(fallback) < len(req.destinations):
+        remaining = req.destinations[len(fallback) :]
+        for city in remaining:
+            fallback.append({"city": city, "check_in": None, "check_out": None})
+    return fallback
+
+
+def _coerce_date(value: Any) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    text = str(value)
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    parsed = _parse_date(text)
+    return parsed.date().isoformat() if parsed else text if text else None
+
+
+def _parse_date(value: Any) -> datetime | None:
+    if not value:
+        return None
+    text = str(value)
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 def _align_bundle_components(
     stays: List[Stay],
     travel: List[TravelLeg],

@@ -36,6 +36,20 @@ class Stay(BaseModel):
     style: Literal["hotel", "boutique", "homestay", "apartment"] = "hotel"
     budget_per_night: float
 
+class BookingLink(BaseModel):
+    category: Literal[
+        "stay",
+        "flight",
+        "train",
+        "bus",
+        "local_pass",
+        "sightseeing",
+        "transport",
+    ]
+    label: str
+    url: str
+    details: Optional[str] = None
+
 class TravelLeg(BaseModel):
     mode: Literal["flight","train","bus","car","rideshare","metro","walk","ferry"]
     frm: str = Field(..., alias="from")
@@ -75,6 +89,7 @@ class PlanBundle(BaseModel):
     feasibility_notes: List[str] = Field(default_factory=list)
     transfer_buffers: Dict[str, float] = Field(default_factory=dict)
     scores: Dict[str, float] = Field(default_factory=dict)
+    booking_links: List[BookingLink] = Field(default_factory=list)
 
 class TripResponse(BaseModel):
     query_echo: TripRequest
