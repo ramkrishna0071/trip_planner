@@ -14,12 +14,14 @@ The development server defaults to `http://localhost:5173`.
 
 ### Connecting to the orchestrator API
 
-Set the backend endpoint that exposes `POST /api/plan` using a Vite environment variable:
+Set the backend endpoint that exposes `POST /api/plan` using a Vite environment variable. A development preset is committed so the UI automatically targets the local FastAPI server:
 
 ```bash
-# .env.local
+# trip_planner_frontend/.env.development
 VITE_API_BASE_URL=http://localhost:8000
 ```
+
+You can override this by creating `.env.local` with the desired URL when pointing the frontend at a different orchestrator deployment.
 
 When the value is missing or the request fails, the app falls back to an interactive sample itinerary so the interface stays explorable offline.
 
