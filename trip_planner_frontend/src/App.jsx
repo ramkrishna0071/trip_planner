@@ -8,7 +8,14 @@ import { sampleResponse } from './lib/sampleData.js';
 import { buildRequestPayload } from './lib/payload.js';
 import './App.css';
 
-const API_BASE_URL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, '') ?? '';
+const rawApiBaseUrl =
+  typeof import.meta.env.VITE_API_BASE_URL === 'string' && import.meta.env.VITE_API_BASE_URL.trim().length
+    ? import.meta.env.VITE_API_BASE_URL
+    : 'http://localhost:8000';
+
+// Trim a trailing slash so request assembly is predictable regardless of how the
+// base URL is configured (env var, default, etc.).
+const API_BASE_URL = rawApiBaseUrl.replace(/\/$/, '');
 
 function formatDestinations(destinations) {
   return destinations.length ? destinations.join(', ') : 'your selected cities';

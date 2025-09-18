@@ -60,11 +60,10 @@ Each bundle’s cost ledger tracks stays, intercity transport, food, activities,
 and remaining misc headroom so you can compare the spend against the requested
 budget at a glance.
 
-> **Tip:** The React frontend under `trip_planner_frontend/` targets
-> `http://localhost:8000/api/plan` by default. Set
-> `VITE_API_BASE_URL=http://localhost:8000` in
-> `trip_planner_frontend/.env.local` while the FastAPI server is running to
-> see live orchestration output instead of the bundled sample itinerary.
+> **Tip:** The React frontend under `trip_planner_frontend/` automatically
+> targets `http://localhost:8000/api/plan`. Start the FastAPI server and run
+> `npm run dev` to see live orchestration output. Create
+> `trip_planner_frontend/.env.local` if you need to target a different base URL.
 
 If you need to restrict browser origins, configure
 `TRIP_PLANNER_ALLOWED_ORIGINS` (comma-separated list). The default `*` keeps
