@@ -17,6 +17,15 @@ const rawApiBaseUrl =
 // base URL is configured (env var, default, etc.).
 const API_BASE_URL = rawApiBaseUrl.replace(/\/$/, '');
 
+class PlannerApiError extends Error {
+  constructor(status, detail) {
+    super(`Planner API responded with ${status}`);
+    this.name = 'PlannerApiError';
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 function formatDestinations(destinations) {
   return destinations.length ? destinations.join(', ') : 'your selected cities';
 }
@@ -75,7 +84,20 @@ function App() {
       });
 
       if (!response.ok) {
-        throw new Error(`Planner API responded with ${response.status}`);
+        let errorDetail = '';
+        try {
+          const contentType = response.headers.get('content-type') ?? '';
+          if (contentType.includes('application/json')) {
+            const problemJson = await response.json();
+            errorDetail = problemJson?.detail || JSON.stringify(problemJson);
+          } else {
+            errorDetail = await response.text();
+          }
+        } catch (parseError) {
+          console.warn('Failed to parse planner error payload', parseError);
+        }
+
+        throw new PlannerApiError(response.status, errorDetail);
       }
 
       const data = await response.json();
@@ -87,6 +109,21 @@ function App() {
           'Here is the latest itinerary including bundles, logistics, and booking shortcuts.',
       });
     } catch (fetchError) {
+      if (fetchError instanceof PlannerApiError) {
+        const detailSuffix = fetchError.detail ? ` — ${fetchError.detail}` : '';
+        const message = `Planner API responded with ${fetchError.status}${detailSuffix}`;
+        console.warn(message);
+        setPlanResult(null);
+        setUsedSampleFallback(false);
+        setError(message);
+        addMessage({
+          role: 'assistant',
+          content:
+            'The orchestrator responded with an error. Inspect the FastAPI logs for details (missing API keys, rate limits, or domain restrictions are common).',
+        });
+        return;
+      }
+
       console.warn('Falling back to sample response', fetchError);
       setPlanResult(sampleResponse);
       setError('Planner API unavailable. Showing interactive sample instead.');
@@ -94,7 +131,7 @@ function App() {
       addMessage({
         role: 'assistant',
         content:
-          'Live scraping is offline, so I loaded a curated sample itinerary. Configure VITE_API_BASE_URL to connect your orchestrator.',
+          'Live scraping is offline, so I loaded a curated sample itinerary. Verify the orchestrator is running and the app can reach it (check VITE_API_BASE_URL).',
       });
     } finally {
       setLoading(false);
