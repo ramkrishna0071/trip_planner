@@ -15,6 +15,49 @@ _level = os.getenv("TRIP_PLANNER_LOG_LEVEL", "INFO").upper()
 logger.setLevel(getattr(logging, _level, logging.INFO))
 logger.propagate = False
 
+_ACTION_WORDS: Tuple[str, ...] = (
+    "visit",
+    "explore",
+    "discover",
+    "experience",
+    "enjoy",
+    "tour",
+    "stroll",
+    "wander",
+    "check out",
+    "head to",
+    "stop by",
+    "make time for",
+    "plan a trip",
+    "don't miss",
+    "do not miss",
+    "must-see",
+    "must see",
+)
+
+_POI_KEYWORDS: Tuple[str, ...] = (
+    "museum",
+    "gallery",
+    "monument",
+    "palace",
+    "castle",
+    "park",
+    "temple",
+    "cathedral",
+    "square",
+    "market",
+    "beach",
+    "bridge",
+    "church",
+    "plaza",
+    "landmark",
+    "observatory",
+    "garden",
+    "disneyland",
+    "resort",
+    "attraction",
+)
+
 
 def expand_destinations(foundation: Dict[str, Any], snippets: Iterable[Dict[str, str]] | None = None) -> Dict[str, Any]:
     """Return per-city highlights using web snippets when available."""
@@ -91,18 +134,57 @@ def _extract_points(text: str, city: str) -> Tuple[List[str], List[str]]:
     sentences = re.split(r"(?<=[.!?])\s+", text)
     highlights: List[str] = []
     dining: List[str] = []
+    city_lower = city.lower()
     for sentence in sentences:
         clean = sentence.strip().replace("\n", " ")
         if len(clean) < 40:
             continue
+
         lower = clean.lower()
-        if city.lower() not in lower:
-            continue
-        if any(keyword in lower for keyword in ("restaurant", "cafe", "bar", "food", "dining")):
+        contains_city = city_lower in lower
+        contains_dining = any(
+            keyword in lower for keyword in ("restaurant", "cafe", "bar", "food", "dining")
+        )
+        contains_action = any(action in lower for action in _ACTION_WORDS)
+        contains_poi = any(keyword in lower for keyword in _POI_KEYWORDS)
+        has_capitalised_landmark = bool(_capitalised_tokens(clean, city_lower))
+
+        if not contains_city:
+            # Allow sentences that call out named landmarks when paired with
+            # action-oriented travel language (e.g. "Don't miss Disneyland").
+            if not (
+                (contains_action and (has_capitalised_landmark or contains_poi))
+                or (contains_poi and has_capitalised_landmark)
+            ):
+                continue
+
+        if contains_dining:
             dining.append(clean)
         else:
             highlights.append(clean)
+
     return highlights[:4], dining[:3]
+
+
+def _capitalised_tokens(sentence: str, city_lower: str) -> List[str]:
+    """Return capitalised tokens that look like landmark names."""
+
+    tokens = re.findall(r"\b[A-Za-z][\w']*\b", sentence)
+    capitalised: List[str] = []
+    for index, token in enumerate(tokens):
+        if index == 0:
+            # The first word is almost always capitalised; skip it to avoid
+            # treating leading adjectives as points of interest.
+            continue
+        if not token[0].isupper():
+            continue
+        lower_token = token.lower()
+        if lower_token == city_lower:
+            continue
+        if token in {"The", "A", "An"}:
+            continue
+        capitalised.append(token)
+    return capitalised
 
 
 def _fallback_highlights(city: str, interests: Iterable[str]) -> List[str]:
